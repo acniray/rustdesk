@@ -3835,8 +3835,11 @@ class FFI {
   // Getter for terminal models
   Map<int, TerminalModel> get terminalModels => _terminalModels;
 
-  FFI(SessionID? sId) {
-    sessionId = sId ?? (isDesktop ? Uuid().v4obj() : _constSessionId);
+  FFI(SessionID? sId, {bool forceUniqueSession = false}) {
+    // Mobile normally reuses one session id. TCP tunnels need their own id so
+    // they can stay alive independently from the regular remote-control UI.
+    sessionId = sId ??
+        ((isDesktop || forceUniqueSession) ? Uuid().v4obj() : _constSessionId);
     imageModel = ImageModel(WeakReference(this));
     ffiModel = FfiModel(WeakReference(this));
     cursorModel = CursorModel(WeakReference(this));
