@@ -1,0 +1,435 @@
+import 'dart:convert';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/models/model.dart';
+import 'package:get/get.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+import 'home_page.dart';
+
+final _androidTunnelController = AndroidTunnelController();
+
+class AndroidTunnelController {
+  FFI? _ffi;
+  bool running = false;
+  String peerId = '';
+  String remoteHost = '';
+  int remotePort = 0;
+  int localPort = 0;
+
+  String get localUrl => localPort > 0 ? 'http://127.0.0.1:$localPort' : '';
+
+  Future<void> start({
+    required String peerId,
+    required String password,
+    required int localPort,
+    required String remoteHost,
+    required int remotePort,
+  }) async {
+    if (running) {
+      await stop();
+    }
+
+    final ffi = FFI(null, forceUniqueSession: true);
+    _ffi = ffi;
+    this.peerId = peerId;
+    this.remoteHost = remoteHost;
+    this.remotePort = remotePort;
+    this.localPort = localPort;
+
+    try {
+      ffi.start(
+        peerId,
+        isPortForward: true,
+        password: password,
+      );
+
+      // Desktop RustDesk intentionally persists port-forward mappings per peer.
+      // This mobile page is a single-tunnel tool, so clear any stale mappings
+      // before installing the mapping requested by the user.
+      try {
+        final peer = bind.mainGetPeerSync(id: peerId);
+        final config = jsonDecode(peer) as Map<String, dynamic>;
+        final existing = (config['port_forwards'] as List<dynamic>? ?? const []);
+        for (final item in existing) {
+          if (item is List && item.isNotEmpty && item[0] is int) {
+            await bind.sessionRemovePortForward(
+              sessionId: ffi.sessionId,
+              localPort: item[0] as int,
+            );
+          }
+        }
+      } catch (e) {
+        debugPrint('Failed to clear stale tunnel mappings: $e');
+      }
+
+      await bind.sessionAddPortForward(
+        sessionId: ffi.sessionId,
+        localPort: localPort,
+        remoteHost: remoteHost,
+        remotePort: remotePort,
+      );
+
+      final ok = await ffi.invokeMethod(
+        'start_tunnel_service',
+        {
+          'description':
+              '127.0.0.1:$localPort -> $remoteHost:$remotePort via $peerId',
+        },
+      );
+      if (!ok) {
+        throw StateError('Unable to start Android tunnel service');
+      }
+      running = true;
+    } catch (_) {
+      await _closeSession();
+      rethrow;
+    }
+  }
+
+  Future<void> stop() async {
+    if (_ffi != null && localPort > 0) {
+      try {
+        await bind.sessionRemovePortForward(
+          sessionId: _ffi!.sessionId,
+          localPort: localPort,
+        );
+      } catch (e) {
+        debugPrint('Failed to remove tunnel mapping: $e');
+      }
+    }
+    await _closeSession();
+    running = false;
+    peerId = '';
+    remoteHost = '';
+    remotePort = 0;
+    localPort = 0;
+  }
+
+  Future<void> _closeSession() async {
+    final ffi = _ffi;
+    _ffi = null;
+    if (ffi != null) {
+      try {
+        ffi.close();
+      } catch (e) {
+        debugPrint('Failed to close tunnel session: $e');
+      }
+      try {
+        await ffi.invokeMethod('stop_tunnel_service');
+      } catch (e) {
+        debugPrint('Failed to stop tunnel service: $e');
+      }
+    }
+  }
+}
+
+class TunnelPage extends StatefulWidget implements PageShape {
+  const TunnelPage({super.key});
+
+  @override
+  final icon = const Icon(Icons.swap_horiz);
+
+  @override
+  final title = 'Tunnel';
+
+  @override
+  final List<Widget> appBarActions = const [];
+
+  @override
+  State<TunnelPage> createState() => _TunnelPageState();
+}
+
+class _TunnelPageState extends State<TunnelPage> {
+  final _peerId = TextEditingController();
+  final _password = TextEditingController();
+  final _localPort = TextEditingController(text: '18080');
+  final _remoteHost = TextEditingController(text: '192.168.1.1');
+  final _remotePort = TextEditingController(text: '80');
+
+  bool _working = false;
+  bool _obscurePassword = true;
+
+  bool get _running => _androidTunnelController.running;
+
+  @override
+  void initState() {
+    super.initState();
+    if (_running) {
+      _peerId.text = _androidTunnelController.peerId;
+      _localPort.text = _androidTunnelController.localPort.toString();
+      _remoteHost.text = _androidTunnelController.remoteHost;
+      _remotePort.text = _androidTunnelController.remotePort.toString();
+    }
+  }
+
+  @override
+  void dispose() {
+    _peerId.dispose();
+    _password.dispose();
+    _localPort.dispose();
+    _remoteHost.dispose();
+    _remotePort.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = _working || _running;
+    return ListView(
+      padding: const EdgeInsets.all(20),
+      children: [
+        Text(
+          'RustDesk TCP Tunnel',
+          style: Theme.of(context).textTheme.headlineSmall,
+        ),
+        const SizedBox(height: 8),
+        Text(
+          'Expose one remote LAN TCP service on this phone as 127.0.0.1. '
+          'No VPNService or root is used.',
+          style: Theme.of(context).textTheme.bodyMedium,
+        ),
+        const SizedBox(height: 24),
+        _field(
+          controller: _peerId,
+          label: 'RustDesk ID',
+          hint: '123456789',
+          enabled: !disabled,
+          keyboardType: TextInputType.number,
+        ),
+        _field(
+          controller: _password,
+          label: 'Password',
+          hint: 'RustDesk peer password',
+          enabled: !disabled,
+          obscureText: _obscurePassword,
+          suffixIcon: IconButton(
+            onPressed: disabled
+                ? null
+                : () => setState(() => _obscurePassword = !_obscurePassword),
+            icon: Icon(
+              _obscurePassword ? Icons.visibility : Icons.visibility_off,
+            ),
+          ),
+        ),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Expanded(
+              child: _field(
+                controller: _localPort,
+                label: 'Local Port',
+                hint: '18080',
+                enabled: !disabled,
+                keyboardType: TextInputType.number,
+                numbersOnly: true,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: _field(
+                controller: _remotePort,
+                label: 'Remote Port',
+                hint: '80',
+                enabled: !disabled,
+                keyboardType: TextInputType.number,
+                numbersOnly: true,
+              ),
+            ),
+          ],
+        ),
+        _field(
+          controller: _remoteHost,
+          label: 'Remote Host',
+          hint: '192.168.1.100',
+          enabled: !disabled,
+        ),
+        const SizedBox(height: 8),
+        if (_running)
+          Card(
+            child: Padding(
+              padding: const EdgeInsets.all(14),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.check_circle, color: Colors.green),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Listening',
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 8),
+                  SelectableText(_androidTunnelController.localUrl),
+                  const SizedBox(height: 4),
+                  Text(
+                    '${_androidTunnelController.remoteHost}:'
+                    '${_androidTunnelController.remotePort} via '
+                    '${_androidTunnelController.peerId}',
+                  ),
+                ],
+              ),
+            ),
+          ),
+        const SizedBox(height: 12),
+        FilledButton.icon(
+          onPressed: _working ? null : (_running ? _stop : _start),
+          icon: _working
+              ? const SizedBox(
+                  width: 18,
+                  height: 18,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : Icon(_running ? Icons.stop : Icons.play_arrow),
+          label: Text(_running ? 'Stop Tunnel' : 'Start Tunnel'),
+        ),
+        if (_running) ...[
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            onPressed: _openBrowser,
+            icon: const Icon(Icons.open_in_browser),
+            label: const Text('Open in Browser'),
+          ),
+          TextButton.icon(
+            onPressed: () async {
+              await Clipboard.setData(
+                ClipboardData(text: _androidTunnelController.localUrl),
+              );
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Local URL copied')),
+                );
+              }
+            },
+            icon: const Icon(Icons.copy),
+            label: const Text('Copy Local URL'),
+          ),
+        ],
+        const SizedBox(height: 18),
+        const Text(
+          'The remote host is resolved from the RustDesk-controlled device. '
+          'For example, remote host 192.168.1.20:8080 can be opened on this '
+          'phone through http://127.0.0.1:18080.',
+        ),
+      ],
+    );
+  }
+
+  Widget _field({
+    required TextEditingController controller,
+    required String label,
+    required String hint,
+    required bool enabled,
+    TextInputType? keyboardType,
+    bool obscureText = false,
+    bool numbersOnly = false,
+    Widget? suffixIcon,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 14),
+      child: TextField(
+        controller: controller,
+        enabled: enabled,
+        keyboardType: keyboardType,
+        obscureText: obscureText,
+        inputFormatters:
+            numbersOnly ? [FilteringTextInputFormatter.digitsOnly] : null,
+        decoration: InputDecoration(
+          labelText: label,
+          hintText: hint,
+          border: const OutlineInputBorder(),
+          suffixIcon: suffixIcon,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _start() async {
+    final peer = _peerId.text.replaceAll(' ', '').trim();
+    final host = _remoteHost.text.trim();
+    final localPort = int.tryParse(_localPort.text.trim());
+    final remotePort = int.tryParse(_remotePort.text.trim());
+
+    if (peer.isEmpty) {
+      _error('RustDesk ID is required.');
+      return;
+    }
+    if (host.isEmpty) {
+      _error('Remote host is required.');
+      return;
+    }
+    if (localPort == null || localPort < 1024 || localPort > 65535) {
+      _error('Local port must be between 1024 and 65535.');
+      return;
+    }
+    if (remotePort == null || remotePort < 1 || remotePort > 65535) {
+      _error('Remote port must be between 1 and 65535.');
+      return;
+    }
+
+    setState(() => _working = true);
+    try {
+      await _androidTunnelController.start(
+        peerId: peer,
+        password: _password.text,
+        localPort: localPort,
+        remoteHost: host,
+        remotePort: remotePort,
+      );
+      if (mounted) {
+        setState(() {});
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Tunnel listening on http://127.0.0.1:$localPort',
+            ),
+          ),
+        );
+      }
+    } catch (e) {
+      _error('Failed to start tunnel: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _working = false);
+      }
+    }
+  }
+
+  Future<void> _stop() async {
+    setState(() => _working = true);
+    try {
+      await _androidTunnelController.stop();
+      if (mounted) {
+        setState(() {});
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _working = false);
+      }
+    }
+  }
+
+  Future<void> _openBrowser() async {
+    final url = _androidTunnelController.localUrl;
+    if (url.isEmpty) return;
+    final ok = await launchUrl(
+      Uri.parse(url),
+      mode: LaunchMode.externalApplication,
+    );
+    if (!ok) {
+      _error('Unable to open $url');
+    }
+  }
+
+  void _error(String text) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text)),
+    );
+  }
+}
