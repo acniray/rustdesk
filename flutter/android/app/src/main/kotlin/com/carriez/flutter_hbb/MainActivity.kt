@@ -240,7 +240,7 @@ class MainActivity : FlutterActivity() {
         // `isFinishing` distinguishes the user really leaving from a destroy
         // for recreation (configuration change, "don't keep activities"),
         // which must not tear down a live session.
-        if (isFinishing) {
+        if (isFinishing && !TunnelService.isRunning) {
             FFI.closeAllSessions()
         }
         mainService?.let {
@@ -266,6 +266,23 @@ class MainActivity : FlutterActivity() {
         flutterMethodChannel.setMethodCallHandler { call, result ->
             // make sure result will be invoked, otherwise flutter will await forever
             when (call.method) {
+                "start_tunnel_service" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val description = args?.get("description")?.toString().orEmpty()
+                    val intent = Intent(activity, TunnelService::class.java).apply {
+                        putExtra("description", description)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+                    result.success(true)
+                }
+                "stop_tunnel_service" -> {
+                    stopService(Intent(activity, TunnelService::class.java))
+                    result.success(true)
+                }
                 "init_service" -> {
                     Intent(activity, MainService::class.java).also {
                         bindService(it, serviceConnection, Context.BIND_AUTO_CREATE)
