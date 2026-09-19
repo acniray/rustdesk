@@ -240,7 +240,7 @@ class MainActivity : FlutterActivity() {
         // `isFinishing` distinguishes the user really leaving from a destroy
         // for recreation (configuration change, "don't keep activities"),
         // which must not tear down a live session.
-        if (isFinishing && !TunnelService.isRunning) {
+        if (isFinishing) {
             FFI.closeAllSessions()
         }
         mainService?.let {
