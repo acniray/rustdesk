@@ -37,7 +37,7 @@ class TunnelService : Service() {
             ?: "TCP tunnel is running"
         startForeground(NOTIFICATION_ID, buildNotification(description))
         isRunning = true
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
