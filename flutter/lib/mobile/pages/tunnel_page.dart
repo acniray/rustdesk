@@ -95,11 +95,12 @@ class AndroidTunnelController extends ChangeNotifier {
 
   String get securityWarning {
     if (secure != true && mux != null) {
-      return 'The RustDesk session is not end-to-end encrypted.';
+      return translate('The RustDesk session is not end-to-end encrypted.');
     }
     if (mux == false) {
-      return 'Legacy forwarding is active. TCP payload leaves the RustDesk '
-          'encrypted session after login.';
+      return translate(
+        'Legacy forwarding is active. TCP payload leaves the RustDesk encrypted session after login.',
+      );
     }
     return '';
   }
@@ -885,7 +886,9 @@ class _TunnelPageState extends State<TunnelPage> {
                       child: peers.isEmpty
                           ? Center(
                               child: Text(
-                                'No saved device matches. Enter an ID above.',
+                                translate(
+                                  'No saved device matches. Enter an ID above.',
+                                ),
                               ),
                             )
                           : ListView.builder(
@@ -1175,7 +1178,7 @@ class _TunnelPageState extends State<TunnelPage> {
       mode: LaunchMode.externalApplication,
     );
     if (!ok) {
-      _error('Unable to open $url');
+      _error('${translate('Unable to open')}: $url');
     }
   }
 
