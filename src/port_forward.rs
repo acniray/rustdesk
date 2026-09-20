@@ -134,7 +134,10 @@ pub async fn listen(
                         break;
                     }
                     Err(err) => {
-                        interface.on_establish_connection_error(err.to_string());
+                        report_establish_connection_error(
+                            &interface,
+                            err.to_string(),
+                        );
                     }
                     _ => {}
                 }
@@ -154,6 +157,21 @@ pub async fn listen(
         }
     }
     Ok(())
+}
+
+fn report_establish_connection_error(interface: &impl Interface, err: String) {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("target device is offline or does not exist")
+        || lower.contains("id does not exist")
+    {
+        // Keep the tunnel flow consistent with the normal connection page.
+        // Passing RustDesk's existing i18n key lets Flutter render the concise
+        // localized "ID does not exist" message instead of a low-level
+        // WebRTC/fallback error chain.
+        interface.msgbox("error", "Connection Error", "ID does not exist", "");
+    } else {
+        interface.on_establish_connection_error(err);
+    }
 }
 
 async fn connect_and_login(
@@ -393,7 +411,10 @@ async fn establish_tunnel(
         }
         Err(err) => {
             tunnel.set_failed();
-            interface.on_establish_connection_error(err.to_string());
+            report_establish_connection_error(
+                interface,
+                err.to_string(),
+            );
         }
         _ => tunnel.set_failed(),
     }

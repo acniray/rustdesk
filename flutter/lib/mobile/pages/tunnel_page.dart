@@ -1,4 +1,5 @@
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -12,23 +13,30 @@ import 'package:url_launcher/url_launcher.dart';
 import 'home_page.dart';
 
 final _androidTunnelController = AndroidTunnelController();
+const _tunnelNotesOptionKey = 'rd_tunnel_notes_v1';
 
 class _TunnelForward {
   final int localPort;
   final String remoteHost;
   final int remotePort;
+  final String note;
 
   const _TunnelForward({
     required this.localPort,
     required this.remoteHost,
     required this.remotePort,
+    this.note = '',
   });
 
-  factory _TunnelForward.fromJson(List<dynamic> json) {
+  factory _TunnelForward.fromJson(
+    List<dynamic> json, {
+    String note = '',
+  }) {
     return _TunnelForward(
       localPort: json[0] as int,
       remoteHost: json[1] as String,
       remotePort: json[2] as int,
+      note: note,
     );
   }
 
@@ -40,6 +48,7 @@ class _TunnelForward {
 
 class AndroidTunnelController extends ChangeNotifier {
   FFI? _ffi;
+  Socket? _probeSocket;
   bool running = false;
   String peerId = '';
   List<_TunnelForward> forwards = <_TunnelForward>[];
@@ -92,6 +101,9 @@ class AndroidTunnelController extends ChangeNotifier {
     mux = model.portForwardMux;
     streamType = model.cachedPeerData.streamType;
     peerVersion = model.portForwardPeerVersion;
+    if (mux != null) {
+      _closeProbeSocket();
+    }
     notifyListeners();
   }
 
@@ -188,10 +200,62 @@ class AndroidTunnelController extends ChangeNotifier {
       }
       running = true;
       notifyListeners();
+
+      // Port-forward connections are normally lazy and authenticate only when
+      // an app first connects to the local listener. Open one local probe now
+      // so Start Tunnel immediately resolves the peer and, when required,
+      // shows RustDesk's native password / 2FA prompt before the user switches
+      // to the browser.
+      await _startPreflight(forwards.first.localPort);
     } catch (_) {
       await _closeSession();
       rethrow;
     }
+  }
+
+  Future<void> _startPreflight(int localPort) async {
+    Object? lastError;
+    for (var attempt = 0; attempt < 20; attempt++) {
+      if (_ffi == null) {
+        return;
+      }
+      try {
+        final socket = await Socket.connect(
+          InternetAddress.loopbackIPv4,
+          localPort,
+          timeout: const Duration(milliseconds: 500),
+        );
+        _closeProbeSocket();
+        _probeSocket = socket;
+        socket.listen(
+          (_) {},
+          onError: (_) {
+            if (identical(_probeSocket, socket)) {
+              _probeSocket = null;
+            }
+          },
+          onDone: () {
+            if (identical(_probeSocket, socket)) {
+              _probeSocket = null;
+            }
+          },
+          cancelOnError: true,
+        );
+        return;
+      } catch (e) {
+        lastError = e;
+        await Future<void>.delayed(const Duration(milliseconds: 100));
+      }
+    }
+    throw StateError(
+      'Failed to probe local tunnel port $localPort: $lastError',
+    );
+  }
+
+  void _closeProbeSocket() {
+    final socket = _probeSocket;
+    _probeSocket = null;
+    socket?.destroy();
   }
 
   Future<void> stop() async {
@@ -207,6 +271,7 @@ class AndroidTunnelController extends ChangeNotifier {
   }
 
   Future<void> _closeSession() async {
+    _closeProbeSocket();
     final ffi = _ffi;
     _ffi = null;
     if (ffi != null) {
@@ -296,8 +361,56 @@ class _TunnelPageState extends State<TunnelPage> {
     }
   }
 
+  Map<int, String> _loadTunnelNotesForPeer(String peerId) {
+    try {
+      final raw = bind.mainGetPeerFlutterOptionSync(
+        id: peerId,
+        k: _tunnelNotesOptionKey,
+      );
+      if (raw.isEmpty) {
+        return <int, String>{};
+      }
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) {
+        return <int, String>{};
+      }
+      final notes = <int, String>{};
+      decoded.forEach((key, value) {
+        final port = int.tryParse(key.toString());
+        if (port != null && value is String && value.trim().isNotEmpty) {
+          notes[port] = value;
+        }
+      });
+      return notes;
+    } catch (e) {
+      debugPrint('Failed to load tunnel notes for $peerId: $e');
+      return <int, String>{};
+    }
+  }
+
+  void _saveTunnelNotesForPeer(String peerId) {
+    if (peerId.isEmpty) {
+      return;
+    }
+    final notes = <String, String>{
+      for (final forward in _forwards)
+        if (forward.note.trim().isNotEmpty)
+          forward.localPort.toString(): forward.note.trim(),
+    };
+    try {
+      bind.mainSetPeerFlutterOptionSync(
+        id: peerId,
+        k: _tunnelNotesOptionKey,
+        v: jsonEncode(notes),
+      );
+    } catch (e) {
+      debugPrint('Failed to save tunnel notes for $peerId: $e');
+    }
+  }
+
   void _loadSavedTunnelsForPeer(String peerId) {
     final result = <_TunnelForward>[];
+    final notes = _loadTunnelNotesForPeer(peerId);
     try {
       final peer = bind.mainGetPeerSync(id: peerId);
       final config = jsonDecode(peer) as Map<String, dynamic>;
@@ -494,6 +607,20 @@ class _TunnelPageState extends State<TunnelPage> {
                       Expanded(
                         child: Text(
                           '${forward.remoteHost}:${forward.remotePort}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 2),
+                  Row(
+                    children: [
+                      const Icon(Icons.notes_outlined, size: 14),
+                      const SizedBox(width: 5),
+                      Expanded(
+                        child: Text(
+                          '${translate('Note')}: '
+                          '${forward.note.isEmpty ? '-' : forward.note}',
                           overflow: TextOverflow.ellipsis,
                         ),
                       ),
@@ -709,6 +836,7 @@ class _TunnelPageState extends State<TunnelPage> {
     final remotePort = TextEditingController(
       text: editing?.remotePort.toString() ?? '',
     );
+    final note = TextEditingController(text: editing?.note ?? '');
 
     final result = await showModalBottomSheet<_TunnelForward>(
       context: context,
@@ -730,6 +858,14 @@ class _TunnelPageState extends State<TunnelPage> {
                 style: Theme.of(sheetContext).textTheme.titleLarge,
               ),
               const SizedBox(height: 16),
+              TextField(
+                controller: note,
+                decoration: InputDecoration(
+                  labelText: translate('Note'),
+                  hintText: translate('input note here'),
+                ),
+              ),
+              const SizedBox(height: 12),
               TextField(
                 controller: localPort,
                 autofocus: editing == null,
@@ -807,6 +943,7 @@ class _TunnelPageState extends State<TunnelPage> {
                         localPort: lp,
                         remoteHost: host,
                         remotePort: rp,
+                        note: note.text.trim(),
                       ),
                     );
                   },
@@ -822,6 +959,7 @@ class _TunnelPageState extends State<TunnelPage> {
     localPort.dispose();
     remoteHost.dispose();
     remotePort.dispose();
+    note.dispose();
 
     if (result == null || !mounted) return;
     setState(() {
@@ -832,12 +970,14 @@ class _TunnelPageState extends State<TunnelPage> {
       }
       _forwards.sort((a, b) => a.localPort.compareTo(b.localPort));
     });
+    _saveTunnelNotesForPeer(_peerId.text.replaceAll(' ', '').trim());
   }
 
   void _removeForward(int index) {
     setState(() {
       _forwards.removeAt(index);
     });
+    _saveTunnelNotesForPeer(_peerId.text.replaceAll(' ', '').trim());
   }
 
   void _sheetError(BuildContext context, String text) {
@@ -866,6 +1006,7 @@ class _TunnelPageState extends State<TunnelPage> {
       return;
     }
 
+    _saveTunnelNotesForPeer(peer);
     setState(() => _working = true);
     try {
       await _androidTunnelController.start(
