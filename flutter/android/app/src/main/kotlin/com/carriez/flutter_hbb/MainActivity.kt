@@ -237,11 +237,14 @@ class MainActivity : FlutterActivity() {
         // MainService, or the accessibility InputService on its own. Only the
         // former gets onTaskRemoved, so close outgoing sessions here too,
         // otherwise a session survives with no UI left to close it.
-        // `isFinishing` distinguishes the user really leaving from a destroy
-        // for recreation (configuration change, "don't keep activities"),
-        // which must not tear down a live session.
-        if (isFinishing) {
+        // A user-started TCP tunnel is intentionally allowed to outlive the
+        // Flutter Activity. Switching apps, pressing Back, or removing the UI
+        // must not tear down the native port-forward listener while its
+        // foreground service is active.
+        if (isFinishing && !TunnelService.isRunning) {
             FFI.closeAllSessions()
+        } else if (isFinishing) {
+            Log.d(logTag, "Activity finished while tunnel service is active; keeping sessions alive")
         }
         mainService?.let {
             unbindService(serviceConnection)

@@ -264,13 +264,17 @@ class MainService : Service() {
         super.onDestroy()
     }
 
-    // Swiping the app away from recents destroys the UI but this service keeps
-    // the process alive, so outgoing sessions would stay connected with no way
-    // to close them. Incoming connections are unaffected: the service keeps
-    // running so the device stays reachable.
+    // Normal remote-control sessions should not survive after their UI task is
+    // removed. A user-started TCP tunnel is different: TunnelService is the
+    // explicit owner of that background operation, so keep the Rust sessions
+    // alive while its foreground notification is active.
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.d(logTag, "onTaskRemoved, closing outgoing sessions")
-        FFI.closeAllSessions()
+        if (TunnelService.isRunning) {
+            Log.d(logTag, "onTaskRemoved, tunnel service active; keeping outgoing sessions alive")
+        } else {
+            Log.d(logTag, "onTaskRemoved, closing outgoing sessions")
+            FFI.closeAllSessions()
+        }
         super.onTaskRemoved(rootIntent)
     }
 

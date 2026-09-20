@@ -5,9 +5,13 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
+import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
 
 /**
@@ -18,6 +22,7 @@ import androidx.core.app.NotificationCompat
  */
 class TunnelService : Service() {
     companion object {
+        private const val TAG = "TunnelService"
         private const val CHANNEL_ID = "RustDeskTunnel"
         private const val NOTIFICATION_ID = 43071
         @Volatile
@@ -25,10 +30,15 @@ class TunnelService : Service() {
             private set
     }
 
+    private var cpuWakeLock: PowerManager.WakeLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
+
     override fun onCreate() {
         super.onCreate()
         createNotificationChannel()
+        acquireBackgroundLocks()
         isRunning = true
+        Log.d(TAG, "created")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -36,16 +46,67 @@ class TunnelService : Service() {
             ?.takeIf { it.isNotBlank() }
             ?: "TCP tunnel is running"
         startForeground(NOTIFICATION_ID, buildNotification(description))
+        acquireBackgroundLocks()
         isRunning = true
+        Log.d(TAG, "foreground tunnel active")
         return START_NOT_STICKY
+    }
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Do not stop with the Flutter task. The whole point of this service is
+        // to keep an explicitly started tunnel available to other foreground
+        // apps (for example, Chrome) after RustDesk leaves the foreground.
+        Log.d(TAG, "UI task removed; keeping tunnel service alive")
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {
         isRunning = false
+        releaseBackgroundLocks()
+        Log.d(TAG, "destroyed")
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun acquireBackgroundLocks() {
+        if (cpuWakeLock?.isHeld != true) {
+            val powerManager =
+                getSystemService(Context.POWER_SERVICE) as PowerManager
+            cpuWakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK,
+                "$packageName:tcp-tunnel"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+
+        if (wifiLock?.isHeld != true) {
+            val wifiManager =
+                applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            wifiLock = wifiManager.createWifiLock(
+                WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+                "$packageName:tcp-tunnel-wifi"
+            ).apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        }
+    }
+
+    private fun releaseBackgroundLocks() {
+        cpuWakeLock?.let {
+            if (it.isHeld) it.release()
+        }
+        cpuWakeLock = null
+
+        wifiLock?.let {
+            if (it.isHeld) it.release()
+        }
+        wifiLock = null
+    }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
