@@ -252,6 +252,7 @@ class _TunnelPageState extends State<TunnelPage> {
   bool _working = false;
   bool _obscurePassword = true;
   bool _loadingSavedPeer = false;
+  String _loadedPeerId = '';
 
   bool get _running => _androidTunnelController.running;
 
@@ -261,6 +262,7 @@ class _TunnelPageState extends State<TunnelPage> {
     _allPeersLoader.init(setState);
     if (_running) {
       _peerId.text = _androidTunnelController.peerId;
+      _loadedPeerId = _androidTunnelController.peerId;
       _forwards = List<_TunnelForward>.from(_androidTunnelController.forwards);
     } else {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
@@ -290,6 +292,7 @@ class _TunnelPageState extends State<TunnelPage> {
     if (id.isEmpty || _running) return;
 
     _peerId.text = id;
+    _loadedPeerId = id;
     _password.clear();
     _loadSavedTunnelsForPeer(id);
     if (mounted) {
@@ -407,6 +410,16 @@ class _TunnelPageState extends State<TunnelPage> {
                   labelText: translate('Remote ID'),
                   border: InputBorder.none,
                 ),
+                onChanged: (value) {
+                  final id = value.replaceAll(' ', '').trim();
+                  if (id != _loadedPeerId) {
+                    setState(() {
+                      _loadedPeerId = id;
+                      _forwards = <_TunnelForward>[];
+                      _password.clear();
+                    });
+                  }
+                },
                 onSubmitted: _selectPeer,
               ),
             ),
@@ -869,6 +882,15 @@ class _TunnelPageState extends State<TunnelPage> {
     if (peer.isEmpty) {
       _error('RustDesk ID is required.');
       return;
+    }
+    // A manually typed saved ID may not have been submitted yet. If there is
+    // no edited mapping list, give it one last chance to load that peer's
+    // native saved port_forwards before rejecting the start.
+    if (_forwards.isEmpty) {
+      _loadSavedTunnelsForPeer(peer);
+      if (mounted) {
+        setState(() {});
+      }
     }
     if (_forwards.isEmpty) {
       _error('Add at least one port forward.');
