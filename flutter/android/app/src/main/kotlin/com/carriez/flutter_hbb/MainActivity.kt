@@ -1018,7 +1018,15 @@ class MainActivity : FlutterActivity() {
     override fun onStop() {
         super.onStop()
         val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
-        if (!disableFloatingWindow && MainService.isReady) {
+        // The controlled-side host keeps a visible overlay while the Activity is
+        // backgrounded. Give an active TCP tunnel the same treatment so Android
+        // keeps the process at the same importance class instead of treating the
+        // tunnel as a foreground-service-only background process.
+        if (!disableFloatingWindow && (MainService.isReady || TunnelService.isRunning)) {
+            Log.d(
+                logTag,
+                "onStop, starting floating window; hostReady=${MainService.isReady}, tunnel=${TunnelService.isRunning}"
+            )
             startService(Intent(this, FloatingWindowService::class.java))
         }
     }

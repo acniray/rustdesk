@@ -63,6 +63,11 @@ class TunnelService : Service() {
     override fun onDestroy() {
         isRunning = false
         releaseBackgroundLocks()
+        // If there is no controlled-side host service, the overlay belonged to
+        // this tunnel and should disappear with it.
+        if (!MainService.isReady) {
+            stopService(Intent(this, FloatingWindowService::class.java))
+        }
         Log.d(TAG, "destroyed")
         super.onDestroy()
     }

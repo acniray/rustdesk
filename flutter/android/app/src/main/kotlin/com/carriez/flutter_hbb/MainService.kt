@@ -260,7 +260,11 @@ class MainService : Service() {
 
     override fun onDestroy() {
         checkMediaPermission()
-        stopService(Intent(this, FloatingWindowService::class.java))
+        // The overlay may now be owned by an active TCP tunnel even after the
+        // remote-control host service is stopped.
+        if (!TunnelService.isRunning) {
+            stopService(Intent(this, FloatingWindowService::class.java))
+        }
         super.onDestroy()
     }
 
