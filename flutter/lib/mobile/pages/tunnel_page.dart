@@ -195,7 +195,7 @@ class TunnelPage extends StatefulWidget implements PageShape {
   final icon = const Icon(Icons.swap_horiz);
 
   @override
-  final title = 'Tunnel';
+  final title = translate('Tunnel');
 
   @override
   final List<Widget> appBarActions = const [];
