@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
+import 'package:flutter_hbb/common/widgets/autocomplete.dart';
 import 'package:flutter_hbb/models/model.dart';
+import 'package:flutter_hbb/models/peer_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:url_launcher/url_launcher.dart';
 
@@ -11,20 +13,44 @@ import 'home_page.dart';
 
 final _androidTunnelController = AndroidTunnelController();
 
+class _TunnelForward {
+  final int localPort;
+  final String remoteHost;
+  final int remotePort;
+
+  const _TunnelForward({
+    required this.localPort,
+    required this.remoteHost,
+    required this.remotePort,
+  });
+
+  factory _TunnelForward.fromJson(List<dynamic> json) {
+    return _TunnelForward(
+      localPort: json[0] as int,
+      remoteHost: json[1] as String,
+      remotePort: json[2] as int,
+    );
+  }
+
+  bool sameEndpoint(_TunnelForward other) =>
+      localPort == other.localPort &&
+      remoteHost == other.remoteHost &&
+      remotePort == other.remotePort;
+}
+
 class AndroidTunnelController extends ChangeNotifier {
   FFI? _ffi;
   bool running = false;
   String peerId = '';
-  String remoteHost = '';
-  int remotePort = 0;
-  int localPort = 0;
+  List<_TunnelForward> forwards = <_TunnelForward>[];
   bool? secure;
   bool? direct;
   bool? mux;
   String streamType = '';
   String peerVersion = '';
 
-  String get localUrl => localPort > 0 ? 'http://127.0.0.1:$localPort' : '';
+  String localUrl(_TunnelForward forward) =>
+      'http://127.0.0.1:${forward.localPort}';
 
   String get connectionLabel =>
       mux == null ? 'Waiting for traffic' : 'Connected';
@@ -80,12 +106,13 @@ class AndroidTunnelController extends ChangeNotifier {
   Future<void> start({
     required String peerId,
     required String password,
-    required int localPort,
-    required String remoteHost,
-    required int remotePort,
+    required List<_TunnelForward> forwards,
   }) async {
     if (running) {
       await stop();
+    }
+    if (forwards.isEmpty) {
+      throw StateError('At least one port forward is required');
     }
 
     final ffi = FFI(null, forceUniqueSession: true);
@@ -93,54 +120,68 @@ class AndroidTunnelController extends ChangeNotifier {
     _resetStatus();
     ffi.ffiModel.addListener(_syncStatus);
     this.peerId = peerId;
-    this.remoteHost = remoteHost;
-    this.remotePort = remotePort;
-    this.localPort = localPort;
+    this.forwards = List<_TunnelForward>.unmodifiable(forwards);
 
     try {
+      // A blank password intentionally falls through to RustDesk's existing
+      // PeerConfig / address-book password lookup.
       ffi.start(
         peerId,
         isPortForward: true,
         password: password,
       );
 
-      // Keep the same persisted port-forward configuration used by RustDesk's
-      // desktop tunnel page. Only replace an existing mapping when this local
-      // port points at a different remote endpoint; preserve all other saved
-      // mappings for the peer.
+      // Reconcile the mobile list with RustDesk's native per-peer
+      // PeerConfig.port_forwards. Existing unchanged mappings are already
+      // started by the port-forward session; changed/new mappings are updated
+      // dynamically through the same API used by the desktop tunnel page.
+      final desiredByPort = <int, _TunnelForward>{
+        for (final forward in forwards) forward.localPort: forward,
+      };
       try {
         final peer = bind.mainGetPeerSync(id: peerId);
         final config = jsonDecode(peer) as Map<String, dynamic>;
-        final existing =
+        final existingJson =
             (config['port_forwards'] as List<dynamic>? ?? const <dynamic>[]);
-        for (final item in existing) {
+        final existing = <_TunnelForward>[];
+
+        for (final item in existingJson) {
           if (item is List &&
               item.length >= 3 &&
-              item[0] == localPort &&
-              (item[1] != remoteHost || item[2] != remotePort)) {
+              item[0] is int &&
+              item[1] is String &&
+              item[2] is int) {
+            existing.add(_TunnelForward.fromJson(item));
+          }
+        }
+
+        for (final saved in existing) {
+          final desired = desiredByPort[saved.localPort];
+          if (desired == null || !saved.sameEndpoint(desired)) {
             await bind.sessionRemovePortForward(
               sessionId: ffi.sessionId,
-              localPort: localPort,
+              localPort: saved.localPort,
             );
-            break;
           }
         }
       } catch (e) {
-        debugPrint('Failed to inspect saved tunnel mappings: $e');
+        debugPrint('Failed to reconcile saved tunnel mappings: $e');
       }
 
-      await bind.sessionAddPortForward(
-        sessionId: ffi.sessionId,
-        localPort: localPort,
-        remoteHost: remoteHost,
-        remotePort: remotePort,
-      );
+      for (final forward in forwards) {
+        await bind.sessionAddPortForward(
+          sessionId: ffi.sessionId,
+          localPort: forward.localPort,
+          remoteHost: forward.remoteHost,
+          remotePort: forward.remotePort,
+        );
+      }
 
       final ok = await ffi.invokeMethod(
         'start_tunnel_service',
         {
           'description':
-              '127.0.0.1:$localPort -> $remoteHost:$remotePort via $peerId',
+              '${forwards.length} TCP port(s) via RustDesk peer $peerId',
         },
       );
       if (!ok) {
@@ -155,22 +196,13 @@ class AndroidTunnelController extends ChangeNotifier {
   }
 
   Future<void> stop() async {
-    if (_ffi != null && localPort > 0) {
-      try {
-        await bind.sessionRemovePortForward(
-          sessionId: _ffi!.sessionId,
-          localPort: localPort,
-        );
-      } catch (e) {
-        debugPrint('Failed to remove tunnel mapping: $e');
-      }
-    }
+    // Closing the session stops all listeners. Do not remove port forwards
+    // here: they are RustDesk's persisted per-peer tunnel configuration and
+    // should be available the next time this peer is selected.
     await _closeSession();
     running = false;
     peerId = '';
-    remoteHost = '';
-    remotePort = 0;
-    localPort = 0;
+    forwards = <_TunnelForward>[];
     _resetStatus();
     notifyListeners();
   }
@@ -213,10 +245,10 @@ class TunnelPage extends StatefulWidget implements PageShape {
 class _TunnelPageState extends State<TunnelPage> {
   final _peerId = TextEditingController();
   final _password = TextEditingController();
-  final _localPort = TextEditingController(text: '18080');
-  final _remoteHost = TextEditingController(text: '192.168.1.1');
-  final _remotePort = TextEditingController(text: '80');
+  final _peerFocusNode = FocusNode();
+  final AllPeersLoader _allPeersLoader = AllPeersLoader();
 
+  List<_TunnelForward> _forwards = <_TunnelForward>[];
   bool _working = false;
   bool _obscurePassword = true;
   bool _loadingSavedPeer = false;
@@ -226,14 +258,14 @@ class _TunnelPageState extends State<TunnelPage> {
   @override
   void initState() {
     super.initState();
+    _allPeersLoader.init(setState);
     if (_running) {
       _peerId.text = _androidTunnelController.peerId;
-      _localPort.text = _androidTunnelController.localPort.toString();
-      _remoteHost.text = _androidTunnelController.remoteHost;
-      _remotePort.text = _androidTunnelController.remotePort.toString();
+      _forwards = List<_TunnelForward>.from(_androidTunnelController.forwards);
     } else {
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        _loadLastSavedPeer();
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        await _allPeersLoader.getAllPeers();
+        await _loadLastSavedPeer();
       });
     }
     _androidTunnelController.addListener(_onTunnelStatusChanged);
@@ -245,8 +277,7 @@ class _TunnelPageState extends State<TunnelPage> {
     try {
       final id = (await bind.mainGetLastRemoteId()).trim();
       if (id.isEmpty || !mounted) return;
-      _peerId.text = id;
-      _loadSavedTunnelForPeer(id);
+      await _selectPeer(id);
     } catch (e) {
       debugPrint('Failed to load last saved peer for tunnel: $e');
     } finally {
@@ -254,32 +285,39 @@ class _TunnelPageState extends State<TunnelPage> {
     }
   }
 
-  void _loadSavedTunnelForPeer(String peerId) {
+  Future<void> _selectPeer(String peerId) async {
+    final id = peerId.replaceAll(' ', '').trim();
+    if (id.isEmpty || _running) return;
+
+    _peerId.text = id;
+    _password.clear();
+    _loadSavedTunnelsForPeer(id);
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
+  void _loadSavedTunnelsForPeer(String peerId) {
+    final result = <_TunnelForward>[];
     try {
       final peer = bind.mainGetPeerSync(id: peerId);
       final config = jsonDecode(peer) as Map<String, dynamic>;
       final existing =
           (config['port_forwards'] as List<dynamic>? ?? const <dynamic>[]);
-      if (existing.isEmpty) return;
-
-      final item = existing.first;
-      if (item is List && item.length >= 3) {
-        final localPort = item[0];
-        final remoteHost = item[1];
-        final remotePort = item[2];
-        if (localPort is int) {
-          _localPort.text = localPort.toString();
-        }
-        if (remoteHost is String && remoteHost.isNotEmpty) {
-          _remoteHost.text = remoteHost;
-        }
-        if (remotePort is int) {
-          _remotePort.text = remotePort.toString();
+      for (final item in existing) {
+        if (item is List &&
+            item.length >= 3 &&
+            item[0] is int &&
+            item[1] is String &&
+            item[2] is int) {
+          result.add(_TunnelForward.fromJson(item));
         }
       }
     } catch (e) {
-      debugPrint('Failed to load saved tunnel mapping for $peerId: $e');
+      debugPrint('Failed to load saved tunnel mappings for $peerId: $e');
     }
+    result.sort((a, b) => a.localPort.compareTo(b.localPort));
+    _forwards = result;
   }
 
   void _onTunnelStatusChanged() {
@@ -291,11 +329,10 @@ class _TunnelPageState extends State<TunnelPage> {
   @override
   void dispose() {
     _androidTunnelController.removeListener(_onTunnelStatusChanged);
+    _allPeersLoader.clear();
     _peerId.dispose();
     _password.dispose();
-    _localPort.dispose();
-    _remoteHost.dispose();
-    _remotePort.dispose();
+    _peerFocusNode.dispose();
     super.dispose();
   }
 
@@ -303,184 +340,274 @@ class _TunnelPageState extends State<TunnelPage> {
   Widget build(BuildContext context) {
     final disabled = _working || _running;
     return ListView(
-      padding: const EdgeInsets.all(20),
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 24),
       children: [
-        Text(
-          'RustDesk TCP Tunnel',
-          style: Theme.of(context).textTheme.headlineSmall,
-        ),
+        _buildPeerSelector(disabled),
+        const SizedBox(height: 12),
+        _buildPasswordField(disabled),
+        const SizedBox(height: 18),
+        _buildForwardHeader(disabled),
         const SizedBox(height: 8),
-        Text(
-          'Expose one remote LAN TCP service on this phone as 127.0.0.1. '
-          'The last RustDesk ID, remembered password, and saved tunnel mapping '
-          'are reused automatically. No VPNService or root is used.',
-          style: Theme.of(context).textTheme.bodyMedium,
-        ),
-        const SizedBox(height: 24),
-        _field(
-          controller: _peerId,
-          label: 'RustDesk ID',
-          hint: '123456789',
-          enabled: !disabled,
-          keyboardType: TextInputType.number,
-          onSubmitted: (value) => _loadSavedTunnelForPeer(value.trim()),
-        ),
-        _field(
-          controller: _password,
-          label: 'Password',
-          hint: 'RustDesk peer password',
-          enabled: !disabled,
-          obscureText: _obscurePassword,
-          suffixIcon: IconButton(
-            onPressed: disabled
+        if (_forwards.isEmpty)
+          _buildEmptyForwardCard()
+        else
+          ..._forwards.asMap().entries.map(
+                (entry) => _buildForwardCard(
+                  entry.key,
+                  entry.value,
+                  disabled,
+                ),
+              ),
+        if (_running) ...[
+          const SizedBox(height: 12),
+          _buildStatusCard(),
+        ],
+        const SizedBox(height: 16),
+        SizedBox(
+          height: 48,
+          child: ElevatedButton.icon(
+            onPressed: _working
                 ? null
-                : () => setState(() => _obscurePassword = !_obscurePassword),
-            icon: Icon(
-              _obscurePassword ? Icons.visibility : Icons.visibility_off,
+                : (_running
+                    ? _stop
+                    : (_forwards.isEmpty ? null : _start)),
+            icon: _working
+                ? const SizedBox(
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : Icon(_running ? Icons.stop : Icons.play_arrow),
+            label: Text(_running ? 'Stop Tunnel' : 'Start Tunnel'),
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildPeerSelector(bool disabled) {
+    return Ink(
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardColor,
+        borderRadius: const BorderRadius.all(Radius.circular(13)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: Padding(
+              padding: const EdgeInsets.only(left: 16),
+              child: TextField(
+                controller: _peerId,
+                focusNode: _peerFocusNode,
+                enabled: !disabled,
+                autocorrect: false,
+                enableSuggestions: false,
+                keyboardType: TextInputType.visiblePassword,
+                decoration: InputDecoration(
+                  labelText: translate('Remote ID'),
+                  border: InputBorder.none,
+                ),
+                onSubmitted: _selectPeer,
+              ),
             ),
           ),
-          helperText: 'Leave blank to use the password already saved for this ID',
+          IconButton(
+            tooltip: translate('Remote ID'),
+            onPressed: disabled ? null : _showPeerPicker,
+            icon: const Icon(Icons.arrow_drop_down),
+          ),
+          const SizedBox(width: 4),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPasswordField(bool disabled) {
+    return TextField(
+      controller: _password,
+      enabled: !disabled,
+      obscureText: _obscurePassword,
+      autocorrect: false,
+      enableSuggestions: false,
+      decoration: InputDecoration(
+        labelText: translate('Password'),
+        helperText: 'Leave blank to use the password already saved for this ID',
+        suffixIcon: IconButton(
+          onPressed: disabled
+              ? null
+              : () =>
+                  setState(() => _obscurePassword = !_obscurePassword),
+          icon: Icon(
+            _obscurePassword ? Icons.visibility : Icons.visibility_off,
+          ),
         ),
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+      ),
+    );
+  }
+
+  Widget _buildForwardHeader(bool disabled) {
+    return Row(
+      children: [
+        Expanded(
+          child: Text(
+            translate('TCP tunneling'),
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+        ),
+        TextButton.icon(
+          onPressed: disabled ? null : () => _editForward(),
+          icon: const Icon(Icons.add),
+          label: Text(translate('Add')),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildEmptyForwardCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 20),
+        child: Column(
           children: [
-            Expanded(
-              child: _field(
-                controller: _localPort,
-                label: 'Local Port',
-                hint: '18080',
-                enabled: !disabled,
-                keyboardType: TextInputType.number,
-                numbersOnly: true,
-              ),
+            Icon(
+              Icons.swap_horiz,
+              size: 32,
+              color: Theme.of(context).disabledColor,
             ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _field(
-                controller: _remotePort,
-                label: 'Remote Port',
-                hint: '80',
-                enabled: !disabled,
-                keyboardType: TextInputType.number,
-                numbersOnly: true,
-              ),
+            const SizedBox(height: 8),
+            Text(
+              'No port forwards configured',
+              style: Theme.of(context).textTheme.bodyMedium,
             ),
           ],
         ),
-        _field(
-          controller: _remoteHost,
-          label: 'Remote Host',
-          hint: '192.168.1.100',
-          enabled: !disabled,
-        ),
-        const SizedBox(height: 8),
-        if (_running)
-          Card(
-            child: Padding(
-              padding: const EdgeInsets.all(14),
+      ),
+    );
+  }
+
+  Widget _buildForwardCard(
+      int index, _TunnelForward forward, bool disabled) {
+    final localUrl = _androidTunnelController.localUrl(forward);
+    return Card(
+      margin: const EdgeInsets.only(bottom: 8),
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+        child: Row(
+          children: [
+            const Icon(Icons.lan_outlined),
+            const SizedBox(width: 12),
+            Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Text(
+                    '127.0.0.1:${forward.localPort}',
+                    style: Theme.of(context).textTheme.titleSmall,
+                  ),
+                  const SizedBox(height: 2),
                   Row(
                     children: [
-                      const Icon(Icons.check_circle, color: Colors.green),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Listening',
-                        style: Theme.of(context).textTheme.titleMedium,
+                      const Icon(Icons.arrow_forward, size: 14),
+                      const SizedBox(width: 5),
+                      Expanded(
+                        child: Text(
+                          '${forward.remoteHost}:${forward.remotePort}',
+                          overflow: TextOverflow.ellipsis,
+                        ),
                       ),
                     ],
                   ),
-                  const SizedBox(height: 8),
-                  SelectableText(_androidTunnelController.localUrl),
-                  const SizedBox(height: 4),
-                  Text(
-                    '${_androidTunnelController.remoteHost}:'
-                    '${_androidTunnelController.remotePort} via '
-                    '${_androidTunnelController.peerId}',
-                  ),
-                  const Divider(height: 24),
-                  _statusRow(
-                    'Connection',
-                    _androidTunnelController.connectionLabel,
-                  ),
-                  _statusRow(
-                    'Encryption',
-                    _androidTunnelController.encryptionLabel,
-                  ),
-                  _statusRow(
-                    'Tunnel mode',
-                    _androidTunnelController.tunnelModeLabel,
-                  ),
-                  _statusRow(
-                    'Transport',
-                    _androidTunnelController.transportLabel,
-                  ),
-                  if (_androidTunnelController.peerVersion.isNotEmpty)
-                    _statusRow(
-                      'Peer version',
-                      _androidTunnelController.peerVersion,
-                    ),
-                  if (_androidTunnelController.hasSecurityWarning) ...[
-                    const SizedBox(height: 10),
-                    Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        const Icon(Icons.warning_amber_rounded),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: Text(
-                            _androidTunnelController.securityWarning,
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
                 ],
               ),
             ),
-          ),
-        const SizedBox(height: 12),
-        FilledButton.icon(
-          onPressed: _working ? null : (_running ? _stop : _start),
-          icon: _working
-              ? const SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                )
-              : Icon(_running ? Icons.stop : Icons.play_arrow),
-          label: Text(_running ? 'Stop Tunnel' : 'Start Tunnel'),
+            if (_running) ...[
+              IconButton(
+                tooltip: 'Open in Browser',
+                onPressed: () => _openBrowser(localUrl),
+                icon: const Icon(Icons.open_in_browser),
+              ),
+              IconButton(
+                tooltip: 'Copy Local URL',
+                onPressed: () => _copyUrl(localUrl),
+                icon: const Icon(Icons.copy),
+              ),
+            ] else ...[
+              IconButton(
+                tooltip: translate('Edit'),
+                onPressed: disabled ? null : () => _editForward(index: index),
+                icon: const Icon(Icons.edit_outlined),
+              ),
+              IconButton(
+                tooltip: translate('Delete'),
+                onPressed: disabled ? null : () => _removeForward(index),
+                icon: const Icon(Icons.delete_outline),
+              ),
+            ],
+          ],
         ),
-        if (_running) ...[
-          const SizedBox(height: 10),
-          OutlinedButton.icon(
-            onPressed: _openBrowser,
-            icon: const Icon(Icons.open_in_browser),
-            label: const Text('Open in Browser'),
-          ),
-          TextButton.icon(
-            onPressed: () async {
-              await Clipboard.setData(
-                ClipboardData(text: _androidTunnelController.localUrl),
-              );
-              if (mounted) {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text('Local URL copied')),
-                );
-              }
-            },
-            icon: const Icon(Icons.copy),
-            label: const Text('Copy Local URL'),
-          ),
-        ],
-        const SizedBox(height: 18),
-        const Text(
-          'The remote host is resolved from the RustDesk-controlled device. '
-          'For example, remote host 192.168.1.20:8080 can be opened on this '
-          'phone through http://127.0.0.1:18080.',
+      ),
+    );
+  }
+
+  Widget _buildStatusCard() {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(14),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.check_circle, color: Colors.green),
+                const SizedBox(width: 8),
+                Text(
+                  translate('Listening ...'),
+                  style: Theme.of(context).textTheme.titleMedium,
+                ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '${_forwards.length} port(s) via ${_androidTunnelController.peerId}',
+            ),
+            const Divider(height: 24),
+            _statusRow(
+              'Connection',
+              _androidTunnelController.connectionLabel,
+            ),
+            _statusRow(
+              'Encryption',
+              _androidTunnelController.encryptionLabel,
+            ),
+            _statusRow(
+              'Tunnel mode',
+              _androidTunnelController.tunnelModeLabel,
+            ),
+            _statusRow(
+              'Transport',
+              _androidTunnelController.transportLabel,
+            ),
+            if (_androidTunnelController.peerVersion.isNotEmpty)
+              _statusRow(
+                'Peer version',
+                _androidTunnelController.peerVersion,
+              ),
+            if (_androidTunnelController.hasSecurityWarning) ...[
+              const SizedBox(height: 10),
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Icon(Icons.warning_amber_rounded),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(_androidTunnelController.securityWarning),
+                  ),
+                ],
+              ),
+            ],
+          ],
         ),
-      ],
+      ),
     );
   }
 
@@ -502,59 +629,249 @@ class _TunnelPageState extends State<TunnelPage> {
     );
   }
 
-  Widget _field({
-    required TextEditingController controller,
-    required String label,
-    required String hint,
-    required bool enabled,
-    TextInputType? keyboardType,
-    bool obscureText = false,
-    bool numbersOnly = false,
-    Widget? suffixIcon,
-    String? helperText,
-    ValueChanged<String>? onSubmitted,
-  }) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 14),
-      child: TextField(
-        controller: controller,
-        enabled: enabled,
-        keyboardType: keyboardType,
-        obscureText: obscureText,
-        inputFormatters:
-            numbersOnly ? [FilteringTextInputFormatter.digitsOnly] : null,
-        onSubmitted: onSubmitted,
-        decoration: InputDecoration(
-          labelText: label,
-          hintText: hint,
-          helperText: helperText,
-          border: const OutlineInputBorder(),
-          suffixIcon: suffixIcon,
-        ),
-      ),
+  Future<void> _showPeerPicker() async {
+    FocusScope.of(context).unfocus();
+    if (_allPeersLoader.needLoad) {
+      await _allPeersLoader.getAllPeers();
+    }
+    if (!mounted) return;
+
+    final search = TextEditingController();
+    var query = '';
+
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return StatefulBuilder(
+          builder: (context, setSheetState) {
+            final normalized = query.trim().toLowerCase();
+            final peers = _allPeersLoader.peers.where((peer) {
+              if (normalized.isEmpty) return true;
+              return peer.id.toLowerCase().contains(normalized) ||
+                  peer.alias.toLowerCase().contains(normalized) ||
+                  peer.hostname.toLowerCase().contains(normalized) ||
+                  peer.username.toLowerCase().contains(normalized);
+            }).toList();
+
+            return FractionallySizedBox(
+              heightFactor: 0.78,
+              child: SafeArea(
+                top: false,
+                child: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 4, 16, 10),
+                      child: TextField(
+                        controller: search,
+                        autofocus: false,
+                        decoration: InputDecoration(
+                          hintText: translate('Remote ID'),
+                          prefixIcon: const Icon(Icons.search),
+                        ),
+                        onChanged: (value) {
+                          setSheetState(() => query = value);
+                        },
+                        onSubmitted: (value) {
+                          final id = value.replaceAll(' ', '').trim();
+                          if (id.isEmpty) return;
+                          Navigator.of(sheetContext).pop();
+                          _selectPeer(id);
+                        },
+                      ),
+                    ),
+                    Expanded(
+                      child: peers.isEmpty
+                          ? Center(
+                              child: Text(
+                                'No saved device matches. Enter an ID above.',
+                              ),
+                            )
+                          : ListView.builder(
+                              padding:
+                                  const EdgeInsets.symmetric(horizontal: 12),
+                              itemCount: peers.length,
+                              itemBuilder: (context, index) {
+                                final peer = peers[index];
+                                return AutocompletePeerTile(
+                                  peer: peer,
+                                  onSelect: () {
+                                    Navigator.of(sheetContext).pop();
+                                    _selectPeer(peer.id);
+                                  },
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    search.dispose();
+  }
+
+  Future<void> _editForward({int? index}) async {
+    final editing = index == null ? null : _forwards[index];
+    final localPort = TextEditingController(
+      text: editing?.localPort.toString() ?? '',
+    );
+    final remoteHost = TextEditingController(
+      text: editing?.remoteHost ?? '192.168.1.1',
+    );
+    final remotePort = TextEditingController(
+      text: editing?.remotePort.toString() ?? '',
+    );
+
+    final result = await showModalBottomSheet<_TunnelForward>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) {
+        return Padding(
+          padding: EdgeInsets.fromLTRB(
+            20,
+            4,
+            20,
+            20 + MediaQuery.of(sheetContext).viewInsets.bottom,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                editing == null ? translate('Add') : translate('Edit'),
+                style: Theme.of(sheetContext).textTheme.titleLarge,
+              ),
+              const SizedBox(height: 16),
+              TextField(
+                controller: localPort,
+                autofocus: editing == null,
+                keyboardType: TextInputType.number,
+                inputFormatters: [
+                  FilteringTextInputFormatter.digitsOnly,
+                ],
+                decoration: InputDecoration(
+                  labelText: translate('Local Port'),
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: remoteHost,
+                decoration: InputDecoration(
+                  labelText: translate('Remote Host'),
+                  hintText: '192.168.1.100',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: remotePort,
+                keyboardType: TextInputType.number,
+                inputFormatters: [
+                  FilteringTextInputFormatter.digitsOnly,
+                ],
+                decoration: InputDecoration(
+                  labelText: translate('Remote Port'),
+                ),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                height: 46,
+                child: ElevatedButton(
+                  onPressed: () {
+                    final lp = int.tryParse(localPort.text.trim());
+                    final host = remoteHost.text.trim();
+                    final rp = int.tryParse(remotePort.text.trim());
+
+                    if (lp == null || lp < 1024 || lp > 65535) {
+                      _sheetError(
+                        sheetContext,
+                        'Local port must be between 1024 and 65535.',
+                      );
+                      return;
+                    }
+                    if (host.isEmpty) {
+                      _sheetError(sheetContext, 'Remote host is required.');
+                      return;
+                    }
+                    if (rp == null || rp < 1 || rp > 65535) {
+                      _sheetError(
+                        sheetContext,
+                        'Remote port must be between 1 and 65535.',
+                      );
+                      return;
+                    }
+
+                    final duplicate = _forwards.asMap().entries.any(
+                          (entry) =>
+                              entry.key != index &&
+                              entry.value.localPort == lp,
+                        );
+                    if (duplicate) {
+                      _sheetError(
+                        sheetContext,
+                        'Local port $lp is already configured.',
+                      );
+                      return;
+                    }
+
+                    Navigator.of(sheetContext).pop(
+                      _TunnelForward(
+                        localPort: lp,
+                        remoteHost: host,
+                        remotePort: rp,
+                      ),
+                    );
+                  },
+                  child: Text(editing == null ? translate('Add') : 'Save'),
+                ),
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    localPort.dispose();
+    remoteHost.dispose();
+    remotePort.dispose();
+
+    if (result == null || !mounted) return;
+    setState(() {
+      if (index == null) {
+        _forwards.add(result);
+      } else {
+        _forwards[index] = result;
+      }
+      _forwards.sort((a, b) => a.localPort.compareTo(b.localPort));
+    });
+  }
+
+  void _removeForward(int index) {
+    setState(() {
+      _forwards.removeAt(index);
+    });
+  }
+
+  void _sheetError(BuildContext context, String text) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(text)),
     );
   }
 
   Future<void> _start() async {
     final peer = _peerId.text.replaceAll(' ', '').trim();
-    final host = _remoteHost.text.trim();
-    final localPort = int.tryParse(_localPort.text.trim());
-    final remotePort = int.tryParse(_remotePort.text.trim());
-
     if (peer.isEmpty) {
       _error('RustDesk ID is required.');
       return;
     }
-    if (host.isEmpty) {
-      _error('Remote host is required.');
-      return;
-    }
-    if (localPort == null || localPort < 1024 || localPort > 65535) {
-      _error('Local port must be between 1024 and 65535.');
-      return;
-    }
-    if (remotePort == null || remotePort < 1 || remotePort > 65535) {
-      _error('Remote port must be between 1 and 65535.');
+    if (_forwards.isEmpty) {
+      _error('Add at least one port forward.');
       return;
     }
 
@@ -563,16 +880,14 @@ class _TunnelPageState extends State<TunnelPage> {
       await _androidTunnelController.start(
         peerId: peer,
         password: _password.text,
-        localPort: localPort,
-        remoteHost: host,
-        remotePort: remotePort,
+        forwards: List<_TunnelForward>.from(_forwards),
       );
       if (mounted) {
         setState(() {});
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Tunnel listening on http://127.0.0.1:$localPort',
+              'Tunnel is listening on ${_forwards.length} local port(s).',
             ),
           ),
         );
@@ -600,9 +915,7 @@ class _TunnelPageState extends State<TunnelPage> {
     }
   }
 
-  Future<void> _openBrowser() async {
-    final url = _androidTunnelController.localUrl;
-    if (url.isEmpty) return;
+  Future<void> _openBrowser(String url) async {
     final ok = await launchUrl(
       Uri.parse(url),
       mode: LaunchMode.externalApplication,
@@ -610,6 +923,14 @@ class _TunnelPageState extends State<TunnelPage> {
     if (!ok) {
       _error('Unable to open $url');
     }
+  }
+
+  Future<void> _copyUrl(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Local URL copied')),
+    );
   }
 
   void _error(String text) {
