@@ -269,8 +269,12 @@ class MainService : Service() {
     // to close them. Incoming connections are unaffected: the service keeps
     // running so the device stays reachable.
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.d(logTag, "onTaskRemoved, closing outgoing sessions")
-        FFI.closeAllSessions()
+        if (TunnelService.isRunning) {
+            Log.d(logTag, "onTaskRemoved, tunnel service active; keeping outgoing sessions alive")
+        } else {
+            Log.d(logTag, "onTaskRemoved, closing outgoing sessions")
+            FFI.closeAllSessions()
+        }
         super.onTaskRemoved(rootIntent)
     }
 
