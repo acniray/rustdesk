@@ -105,7 +105,6 @@ class AndroidTunnelController extends ChangeNotifier {
 
   Future<void> start({
     required String peerId,
-    required String password,
     required List<_TunnelForward> forwards,
   }) async {
     if (running) {
@@ -123,12 +122,12 @@ class AndroidTunnelController extends ChangeNotifier {
     this.forwards = List<_TunnelForward>.unmodifiable(forwards);
 
     try {
-      // A blank password intentionally falls through to RustDesk's existing
-      // PeerConfig / address-book password lookup.
+      // Match the normal connection page: let RustDesk resolve any remembered
+      // PeerConfig/address-book password itself. If none is available, the
+      // existing input-password / re-input-password / 2FA dialogs are used.
       ffi.start(
         peerId,
         isPortForward: true,
-        password: password,
       );
 
       // Reconcile the mobile list with RustDesk's native per-peer
@@ -244,13 +243,11 @@ class TunnelPage extends StatefulWidget implements PageShape {
 
 class _TunnelPageState extends State<TunnelPage> {
   final _peerId = TextEditingController();
-  final _password = TextEditingController();
   final _peerFocusNode = FocusNode();
   final AllPeersLoader _allPeersLoader = AllPeersLoader();
 
   List<_TunnelForward> _forwards = <_TunnelForward>[];
   bool _working = false;
-  bool _obscurePassword = true;
   bool _loadingSavedPeer = false;
   String _loadedPeerId = '';
 
@@ -293,7 +290,6 @@ class _TunnelPageState extends State<TunnelPage> {
 
     _peerId.text = id;
     _loadedPeerId = id;
-    _password.clear();
     _loadSavedTunnelsForPeer(id);
     if (mounted) {
       setState(() {});
@@ -334,7 +330,6 @@ class _TunnelPageState extends State<TunnelPage> {
     _androidTunnelController.removeListener(_onTunnelStatusChanged);
     _allPeersLoader.clear();
     _peerId.dispose();
-    _password.dispose();
     _peerFocusNode.dispose();
     super.dispose();
   }
@@ -346,8 +341,6 @@ class _TunnelPageState extends State<TunnelPage> {
       padding: const EdgeInsets.fromLTRB(12, 10, 12, 24),
       children: [
         _buildPeerSelector(disabled),
-        const SizedBox(height: 12),
-        _buildPasswordField(disabled),
         const SizedBox(height: 18),
         _buildForwardHeader(disabled),
         const SizedBox(height: 8),
@@ -416,7 +409,6 @@ class _TunnelPageState extends State<TunnelPage> {
                     setState(() {
                       _loadedPeerId = id;
                       _forwards = <_TunnelForward>[];
-                      _password.clear();
                     });
                   }
                 },
@@ -431,29 +423,6 @@ class _TunnelPageState extends State<TunnelPage> {
           ),
           const SizedBox(width: 4),
         ],
-      ),
-    );
-  }
-
-  Widget _buildPasswordField(bool disabled) {
-    return TextField(
-      controller: _password,
-      enabled: !disabled,
-      obscureText: _obscurePassword,
-      autocorrect: false,
-      enableSuggestions: false,
-      decoration: InputDecoration(
-        labelText: translate('Password'),
-        helperText: 'Leave blank to use the password already saved for this ID',
-        suffixIcon: IconButton(
-          onPressed: disabled
-              ? null
-              : () =>
-                  setState(() => _obscurePassword = !_obscurePassword),
-          icon: Icon(
-            _obscurePassword ? Icons.visibility : Icons.visibility_off,
-          ),
-        ),
       ),
     );
   }
@@ -901,7 +870,6 @@ class _TunnelPageState extends State<TunnelPage> {
     try {
       await _androidTunnelController.start(
         peerId: peer,
-        password: _password.text,
         forwards: List<_TunnelForward>.from(_forwards),
       );
       if (mounted) {
