@@ -53,7 +53,7 @@ class HomePageState extends State<HomePage> {
         appBarActions: [],
       ));
       if (isAndroid) {
-        _pages.add(const TunnelPage());
+        _pages.add(TunnelPage());
       }
     }
     if (isAndroid && !bind.isOutgoingOnly()) {

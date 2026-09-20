@@ -226,7 +226,7 @@ class AndroidTunnelController extends ChangeNotifier {
 }
 
 class TunnelPage extends StatefulWidget implements PageShape {
-  const TunnelPage({super.key});
+  TunnelPage({super.key});
 
   @override
   final icon = const Icon(Icons.swap_horiz);
