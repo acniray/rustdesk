@@ -6,6 +6,10 @@ on:
       - feature/android-tcp-tunnel
   workflow_dispatch:
 
+concurrency:
+  group: rd-tunnel-android-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   RUST_VERSION: "1.75"
   CARGO_NDK_VERSION: "3.1.2"
