@@ -133,6 +133,50 @@ jobs:
           cp ./target/aarch64-linux-android/release/liblibrustdesk.so \
              ./flutter/android/app/src/main/jniLibs/arm64-v8a/librustdesk.so
 
+      - name: Configure fixed RD Tunnel signing
+        env:
+          RD_TUNNEL_KEYSTORE_BASE64: ${{ secrets.RD_TUNNEL_KEYSTORE_BASE64 }}
+          RD_TUNNEL_KEYSTORE_PASSWORD: ${{ secrets.RD_TUNNEL_KEYSTORE_PASSWORD }}
+          EXPECTED_CERT_SHA256: "D6:91:97:A7:76:6A:C0:7A:B4:96:B6:BC:E0:EF:AA:76:E7:A0:9F:39:40:BF:C8:8C:8F:23:86:60:17:AF:5D:CA"
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${RD_TUNNEL_KEYSTORE_BASE64}" || -z "${RD_TUNNEL_KEYSTORE_PASSWORD}" ]]; then
+            echo "::error::RD Tunnel signing secrets are not configured."
+            echo "::error::Set RD_TUNNEL_KEYSTORE_BASE64 and RD_TUNNEL_KEYSTORE_PASSWORD in repository Actions secrets."
+            exit 1
+          fi
+
+          printf '%s' "${RD_TUNNEL_KEYSTORE_BASE64}" | base64 --decode \
+            > ./flutter/android/app/rd-tunnel-release.jks
+          chmod 600 ./flutter/android/app/rd-tunnel-release.jks
+
+          cat > ./flutter/android/key.properties <<EOF
+          storePassword=${RD_TUNNEL_KEYSTORE_PASSWORD}
+          keyPassword=${RD_TUNNEL_KEYSTORE_PASSWORD}
+          keyAlias=rd-tunnel
+          storeFile=rd-tunnel-release.jks
+          EOF
+          chmod 600 ./flutter/android/key.properties
+
+          actual_fingerprint="$(
+            keytool -list -v \
+              -keystore ./flutter/android/app/rd-tunnel-release.jks \
+              -alias rd-tunnel \
+              -storepass "${RD_TUNNEL_KEYSTORE_PASSWORD}" \
+            | sed -n 's/^[[:space:]]*SHA256: //p' \
+            | head -n 1
+          )"
+
+          if [[ "${actual_fingerprint}" != "${EXPECTED_CERT_SHA256}" ]]; then
+            echo "::error::Signing certificate mismatch."
+            echo "::error::Expected ${EXPECTED_CERT_SHA256}, got ${actual_fingerprint:-<none>}."
+            exit 1
+          fi
+
+          echo "Using fixed RD Tunnel signing certificate: ${actual_fingerprint}"
+
       - name: Build installable APK
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -141,7 +185,6 @@ jobs:
         run: |
           export PATH=/usr/lib/jvm/java-17-openjdk-amd64/bin:$PATH
           sed -i "s/org.gradle.jvmargs=-Xmx1024M/org.gradle.jvmargs=-Xmx2g/g" ./flutter/android/gradle.properties
-          sed -i "s/signingConfigs.release/signingConfigs.debug/g" ./flutter/android/app/build.gradle
 
           mkdir -p ./flutter/android/app/src/main/jniLibs/arm64-v8a
           cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so" \
@@ -163,3 +206,10 @@ jobs:
           path: artifacts/RD-Tunnel-arm64-v8a.apk
           if-no-files-found: error
           retention-days: 7
+
+      - name: Remove signing material
+        if: always()
+        shell: bash
+        run: |
+          rm -f ./flutter/android/app/rd-tunnel-release.jks
+          rm -f ./flutter/android/key.properties
