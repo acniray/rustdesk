@@ -104,23 +104,29 @@ class AndroidTunnelController extends ChangeNotifier {
         password: password,
       );
 
-      // Desktop RustDesk intentionally persists port-forward mappings per peer.
-      // This mobile page is a single-tunnel tool, so clear any stale mappings
-      // before installing the mapping requested by the user.
+      // Keep the same persisted port-forward configuration used by RustDesk's
+      // desktop tunnel page. Only replace an existing mapping when this local
+      // port points at a different remote endpoint; preserve all other saved
+      // mappings for the peer.
       try {
         final peer = bind.mainGetPeerSync(id: peerId);
         final config = jsonDecode(peer) as Map<String, dynamic>;
-        final existing = (config['port_forwards'] as List<dynamic>? ?? const []);
+        final existing =
+            (config['port_forwards'] as List<dynamic>? ?? const <dynamic>[]);
         for (final item in existing) {
-          if (item is List && item.isNotEmpty && item[0] is int) {
+          if (item is List &&
+              item.length >= 3 &&
+              item[0] == localPort &&
+              (item[1] != remoteHost || item[2] != remotePort)) {
             await bind.sessionRemovePortForward(
               sessionId: ffi.sessionId,
-              localPort: item[0] as int,
+              localPort: localPort,
             );
+            break;
           }
         }
       } catch (e) {
-        debugPrint('Failed to clear stale tunnel mappings: $e');
+        debugPrint('Failed to inspect saved tunnel mappings: $e');
       }
 
       await bind.sessionAddPortForward(
@@ -213,6 +219,7 @@ class _TunnelPageState extends State<TunnelPage> {
 
   bool _working = false;
   bool _obscurePassword = true;
+  bool _loadingSavedPeer = false;
 
   bool get _running => _androidTunnelController.running;
 
@@ -224,8 +231,55 @@ class _TunnelPageState extends State<TunnelPage> {
       _localPort.text = _androidTunnelController.localPort.toString();
       _remoteHost.text = _androidTunnelController.remoteHost;
       _remotePort.text = _androidTunnelController.remotePort.toString();
+    } else {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _loadLastSavedPeer();
+      });
     }
     _androidTunnelController.addListener(_onTunnelStatusChanged);
+  }
+
+  Future<void> _loadLastSavedPeer() async {
+    if (_loadingSavedPeer || _running) return;
+    _loadingSavedPeer = true;
+    try {
+      final id = (await bind.mainGetLastRemoteId()).trim();
+      if (id.isEmpty || !mounted) return;
+      _peerId.text = id;
+      _loadSavedTunnelForPeer(id);
+    } catch (e) {
+      debugPrint('Failed to load last saved peer for tunnel: $e');
+    } finally {
+      _loadingSavedPeer = false;
+    }
+  }
+
+  void _loadSavedTunnelForPeer(String peerId) {
+    try {
+      final peer = bind.mainGetPeerSync(id: peerId);
+      final config = jsonDecode(peer) as Map<String, dynamic>;
+      final existing =
+          (config['port_forwards'] as List<dynamic>? ?? const <dynamic>[]);
+      if (existing.isEmpty) return;
+
+      final item = existing.first;
+      if (item is List && item.length >= 3) {
+        final localPort = item[0];
+        final remoteHost = item[1];
+        final remotePort = item[2];
+        if (localPort is int) {
+          _localPort.text = localPort.toString();
+        }
+        if (remoteHost is String && remoteHost.isNotEmpty) {
+          _remoteHost.text = remoteHost;
+        }
+        if (remotePort is int) {
+          _remotePort.text = remotePort.toString();
+        }
+      }
+    } catch (e) {
+      debugPrint('Failed to load saved tunnel mapping for $peerId: $e');
+    }
   }
 
   void _onTunnelStatusChanged() {
@@ -258,7 +312,8 @@ class _TunnelPageState extends State<TunnelPage> {
         const SizedBox(height: 8),
         Text(
           'Expose one remote LAN TCP service on this phone as 127.0.0.1. '
-          'No VPNService or root is used.',
+          'The last RustDesk ID, remembered password, and saved tunnel mapping '
+          'are reused automatically. No VPNService or root is used.',
           style: Theme.of(context).textTheme.bodyMedium,
         ),
         const SizedBox(height: 24),
@@ -268,6 +323,7 @@ class _TunnelPageState extends State<TunnelPage> {
           hint: '123456789',
           enabled: !disabled,
           keyboardType: TextInputType.number,
+          onSubmitted: (value) => _loadSavedTunnelForPeer(value.trim()),
         ),
         _field(
           controller: _password,
@@ -283,6 +339,7 @@ class _TunnelPageState extends State<TunnelPage> {
               _obscurePassword ? Icons.visibility : Icons.visibility_off,
             ),
           ),
+          helperText: 'Leave blank to use the password already saved for this ID',
         ),
         Row(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -454,6 +511,8 @@ class _TunnelPageState extends State<TunnelPage> {
     bool obscureText = false,
     bool numbersOnly = false,
     Widget? suffixIcon,
+    String? helperText,
+    ValueChanged<String>? onSubmitted,
   }) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 14),
@@ -464,9 +523,11 @@ class _TunnelPageState extends State<TunnelPage> {
         obscureText: obscureText,
         inputFormatters:
             numbersOnly ? [FilteringTextInputFormatter.digitsOnly] : null,
+        onSubmitted: onSubmitted,
         decoration: InputDecoration(
           labelText: label,
           hintText: hint,
+          helperText: helperText,
           border: const OutlineInputBorder(),
           suffixIcon: suffixIcon,
         ),
