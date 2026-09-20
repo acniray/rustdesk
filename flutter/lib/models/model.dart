@@ -120,6 +120,9 @@ class FfiModel with ChangeNotifier {
   bool? _direct;
   bool? _portForwardMux;
   String _portForwardPeerVersion = '';
+  bool _portForwardAuthPending = false;
+  String _portForwardError = '';
+  bool _portForwardClosed = false;
   bool _touchMode = false;
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
@@ -161,6 +164,12 @@ class FfiModel with ChangeNotifier {
   bool? get portForwardMux => _portForwardMux;
 
   String get portForwardPeerVersion => _portForwardPeerVersion;
+
+  bool get portForwardAuthPending => _portForwardAuthPending;
+
+  String get portForwardError => _portForwardError;
+
+  bool get portForwardClosed => _portForwardClosed;
 
   PeerInfo get pi => _pi;
 
@@ -263,6 +272,9 @@ class FfiModel with ChangeNotifier {
     _direct = null;
     _portForwardMux = null;
     _portForwardPeerVersion = '';
+    _portForwardAuthPending = false;
+    _portForwardError = '';
+    _portForwardClosed = false;
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
@@ -366,6 +378,9 @@ class FfiModel with ChangeNotifier {
             evt['direct'] == 'true', evt['stream_type'] ?? '');
         _portForwardMux = evt['mux'] == 'true';
         _portForwardPeerVersion = evt['peer_version'] ?? '';
+        _portForwardAuthPending = false;
+        _portForwardError = '';
+        _portForwardClosed = false;
         notifyListeners();
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
@@ -911,6 +926,21 @@ class FfiModel with ChangeNotifier {
     final text = evt['text'];
     final link = evt['link'];
 
+    if (parent.target?.connType == ConnType.portForward) {
+      if (type == 'input-password' ||
+          type == 're-input-password' ||
+          type == 'input-2fa') {
+        _portForwardAuthPending = true;
+        _portForwardError = '';
+        _portForwardClosed = false;
+        notifyListeners();
+      } else if (title == 'Connection Error' && type == 'error') {
+        _portForwardAuthPending = false;
+        _portForwardError = text?.toString() ?? 'Connection Error';
+        notifyListeners();
+      }
+    }
+
     // The peer-gone detector reconnects under `restarting-show` rather than an error title, so
     // it needs naming here too. By its own title, not the type: an explicitly restarted remote
     // device reaches the same type from a path this change does not touch.
@@ -991,6 +1021,15 @@ class FfiModel with ChangeNotifier {
       }
       showMsgBox(sessionId, type, title, text, link, hasRetry, dialogManager);
     }
+  }
+
+  void markPortForwardClosed() {
+    _portForwardAuthPending = false;
+    _portForwardClosed = true;
+    if (_portForwardError.isEmpty) {
+      _portForwardError = 'Connection closed';
+    }
+    notifyListeners();
   }
 
   void resetRestartReconnectState() {
@@ -4054,6 +4093,9 @@ class FFI {
         if (message is EventToUI_Event) {
           if (message.field0 == "close") {
             closed = true;
+            if (connType == ConnType.portForward) {
+              ffiModel.markPortForwardClosed();
+            }
             debugPrint('Exit session event loop');
             return;
           }

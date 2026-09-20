@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -55,27 +56,37 @@ class AndroidTunnelController extends ChangeNotifier {
   bool? secure;
   bool? direct;
   bool? mux;
+  bool authPending = false;
   String streamType = '';
   String peerVersion = '';
+  String errorText = '';
+  bool _closingAfterFailure = false;
 
   String localUrl(_TunnelForward forward) =>
       'http://127.0.0.1:${forward.localPort}';
 
-  String get connectionLabel =>
-      mux == null ? 'Waiting for traffic' : 'Connected';
+  bool get failed => errorText.isNotEmpty;
+  bool get connected => !failed && mux != null;
+
+  String get connectionLabel {
+    if (failed) return translate('Connection failed');
+    if (connected) return translate('Connected');
+    if (authPending) return translate('Password Required');
+    return translate('Connecting...');
+  }
 
   String get encryptionLabel {
-    if (mux == null) return 'Pending';
-    if (secure != true) return 'Insecure';
-    return mux == true ? 'E2EE' : 'Legacy / raw';
+    if (!connected) return translate('Pending');
+    if (secure != true) return translate('Insecure');
+    return mux == true ? 'E2EE' : translate('Legacy / raw');
   }
 
   String get tunnelModeLabel =>
-      mux == null ? 'Pending' : (mux == true ? 'MUX' : 'Legacy');
+      connected ? (mux == true ? 'MUX' : translate('Legacy')) : translate('Pending');
 
   String get transportLabel {
-    if (direct == null) return 'Pending';
-    final path = direct == true ? 'Direct' : 'Relay';
+    if (!connected || direct == null) return translate('Pending');
+    final path = direct == true ? translate('Direct') : translate('Relay');
     return streamType.isEmpty ? path : '$path ($streamType)';
   }
 
@@ -99,9 +110,25 @@ class AndroidTunnelController extends ChangeNotifier {
     secure = model.secure;
     direct = model.direct;
     mux = model.portForwardMux;
+    authPending = model.portForwardAuthPending;
     streamType = model.cachedPeerData.streamType;
     peerVersion = model.portForwardPeerVersion;
+
+    final modelError = model.portForwardError;
+    if (modelError.isNotEmpty || model.portForwardClosed) {
+      errorText =
+          modelError.isNotEmpty ? modelError : translate('Connection closed');
+      running = false;
+      authPending = false;
+      _closeProbeSocket();
+      notifyListeners();
+      unawaited(_closeFailedSession());
+      return;
+    }
+
     if (mux != null) {
+      errorText = '';
+      authPending = false;
       _closeProbeSocket();
     }
     notifyListeners();
@@ -111,17 +138,22 @@ class AndroidTunnelController extends ChangeNotifier {
     secure = null;
     direct = null;
     mux = null;
+    authPending = false;
     streamType = '';
     peerVersion = '';
+    errorText = '';
   }
 
   Future<void> start({
     required String peerId,
     required List<_TunnelForward> forwards,
   }) async {
-    if (running) {
-      await stop();
+    // A failed/cancelled authentication can leave a closed or stale FFI
+    // object around after the error dialog. Always retire it before retrying.
+    if (_ffi != null) {
+      await _closeSession();
     }
+    running = false;
     if (forwards.isEmpty) {
       throw StateError('At least one port forward is required');
     }
@@ -207,9 +239,28 @@ class AndroidTunnelController extends ChangeNotifier {
       // shows RustDesk's native password / 2FA prompt before the user switches
       // to the browser.
       await _startPreflight(forwards.first.localPort);
-    } catch (_) {
+    } catch (e) {
+      errorText = e.toString();
+      running = false;
+      authPending = false;
       await _closeSession();
+      notifyListeners();
       rethrow;
+    }
+  }
+
+  Future<void> _closeFailedSession() async {
+    if (_closingAfterFailure) return;
+    _closingAfterFailure = true;
+    try {
+      // Let the msgbox handler finish presenting the error before closing the
+      // failed port-forward session. FFI.close() does not dismiss its dialog
+      // manager, but it does release the local listeners and native session.
+      await Future<void>.delayed(Duration.zero);
+      await _closeSession();
+    } finally {
+      _closingAfterFailure = false;
+      notifyListeners();
     }
   }
 
@@ -422,7 +473,12 @@ class _TunnelPageState extends State<TunnelPage> {
             item[0] is int &&
             item[1] is String &&
             item[2] is int) {
-          result.add(_TunnelForward.fromJson(item));
+          result.add(
+            _TunnelForward.fromJson(
+              item,
+              note: notes[item[0] as int] ?? '',
+            ),
+          );
         }
       }
     } catch (e) {
@@ -467,7 +523,7 @@ class _TunnelPageState extends State<TunnelPage> {
                   disabled,
                 ),
               ),
-        if (_running) ...[
+        if (_running || _androidTunnelController.failed) ...[
           const SizedBox(height: 12),
           _buildStatusCard(),
         ],
@@ -487,7 +543,9 @@ class _TunnelPageState extends State<TunnelPage> {
                     child: CircularProgressIndicator(strokeWidth: 2),
                   )
                 : Icon(_running ? Icons.stop : Icons.play_arrow),
-            label: Text(_running ? 'Stop Tunnel' : 'Start Tunnel'),
+            label: Text(
+              translate(_running ? 'Stop Tunnel' : 'Start Tunnel'),
+            ),
           ),
         ),
       ],
@@ -571,7 +629,7 @@ class _TunnelPageState extends State<TunnelPage> {
             ),
             const SizedBox(height: 8),
             Text(
-              'No port forwards configured',
+              translate('No port forwards configured'),
               style: Theme.of(context).textTheme.bodyMedium,
             ),
           ],
@@ -631,12 +689,12 @@ class _TunnelPageState extends State<TunnelPage> {
             ),
             if (_running) ...[
               IconButton(
-                tooltip: 'Open in Browser',
+                tooltip: translate('Open in Browser'),
                 onPressed: () => _openBrowser(localUrl),
                 icon: const Icon(Icons.open_in_browser),
               ),
               IconButton(
-                tooltip: 'Copy Local URL',
+                tooltip: translate('Copy Local URL'),
                 onPressed: () => _copyUrl(localUrl),
                 icon: const Icon(Icons.copy),
               ),
@@ -659,6 +717,21 @@ class _TunnelPageState extends State<TunnelPage> {
   }
 
   Widget _buildStatusCard() {
+    final controller = _androidTunnelController;
+    final failed = controller.failed;
+    final connected = controller.connected;
+
+    final IconData icon;
+    if (failed) {
+      icon = Icons.error;
+    } else if (connected) {
+      icon = Icons.check_circle;
+    } else if (controller.authPending) {
+      icon = Icons.lock_outline;
+    } else {
+      icon = Icons.hourglass_top;
+    }
+
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(14),
@@ -667,52 +740,70 @@ class _TunnelPageState extends State<TunnelPage> {
           children: [
             Row(
               children: [
-                const Icon(Icons.check_circle, color: Colors.green),
+                Icon(
+                  icon,
+                  color: failed
+                      ? Theme.of(context).colorScheme.error
+                      : (connected ? Colors.green : null),
+                ),
                 const SizedBox(width: 8),
-                Text(
-                  translate('Listening ...'),
-                  style: Theme.of(context).textTheme.titleMedium,
+                Expanded(
+                  child: Text(
+                    controller.connectionLabel,
+                    style: Theme.of(context).textTheme.titleMedium,
+                  ),
                 ),
               ],
             ),
             const SizedBox(height: 4),
             Text(
-              '${_forwards.length} port(s) via ${_androidTunnelController.peerId}',
+              '${translate('Remote ID')}: ${controller.peerId} · '
+              '${_forwards.length} ${translate('Port mappings')}',
             ),
             const Divider(height: 24),
             _statusRow(
-              'Connection',
-              _androidTunnelController.connectionLabel,
+              translate('Connection'),
+              controller.connectionLabel,
             ),
-            _statusRow(
-              'Encryption',
-              _androidTunnelController.encryptionLabel,
-            ),
-            _statusRow(
-              'Tunnel mode',
-              _androidTunnelController.tunnelModeLabel,
-            ),
-            _statusRow(
-              'Transport',
-              _androidTunnelController.transportLabel,
-            ),
-            if (_androidTunnelController.peerVersion.isNotEmpty)
+            if (failed) ...[
+              const SizedBox(height: 4),
+              Text(
+                translate(controller.errorText),
+                style: TextStyle(
+                  color: Theme.of(context).colorScheme.error,
+                ),
+              ),
+            ] else if (connected) ...[
               _statusRow(
-                'Peer version',
-                _androidTunnelController.peerVersion,
+                translate('Encryption'),
+                controller.encryptionLabel,
               ),
-            if (_androidTunnelController.hasSecurityWarning) ...[
-              const SizedBox(height: 10),
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Icon(Icons.warning_amber_rounded),
-                  const SizedBox(width: 8),
-                  Expanded(
-                    child: Text(_androidTunnelController.securityWarning),
-                  ),
-                ],
+              _statusRow(
+                translate('Tunnel mode'),
+                controller.tunnelModeLabel,
               ),
+              _statusRow(
+                translate('Transport'),
+                controller.transportLabel,
+              ),
+              if (controller.peerVersion.isNotEmpty)
+                _statusRow(
+                  translate('Peer version'),
+                  controller.peerVersion,
+                ),
+              if (controller.hasSecurityWarning) ...[
+                const SizedBox(height: 10),
+                Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Icon(Icons.warning_amber_rounded),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(controller.securityWarning),
+                    ),
+                  ],
+                ),
+              ],
             ],
           ],
         ),
@@ -825,16 +916,26 @@ class _TunnelPageState extends State<TunnelPage> {
     search.dispose();
   }
 
+  int _suggestLocalPort() {
+    final used = _forwards.map((e) => e.localPort).toSet();
+    var candidate = 18080;
+    while (used.contains(candidate) && candidate < 65535) {
+      candidate++;
+    }
+    return candidate;
+  }
+
   Future<void> _editForward({int? index}) async {
     final editing = index == null ? null : _forwards[index];
+    final formKey = GlobalKey<FormState>();
     final localPort = TextEditingController(
-      text: editing?.localPort.toString() ?? '',
+      text: editing?.localPort.toString() ?? _suggestLocalPort().toString(),
     );
     final remoteHost = TextEditingController(
       text: editing?.remoteHost ?? '192.168.1.1',
     );
     final remotePort = TextEditingController(
-      text: editing?.remotePort.toString() ?? '',
+      text: editing?.remotePort.toString() ?? '80',
     );
     final note = TextEditingController(text: editing?.note ?? '');
 
@@ -843,114 +944,142 @@ class _TunnelPageState extends State<TunnelPage> {
       isScrollControlled: true,
       showDragHandle: true,
       builder: (sheetContext) {
-        return Padding(
-          padding: EdgeInsets.fromLTRB(
-            20,
-            4,
-            20,
-            20 + MediaQuery.of(sheetContext).viewInsets.bottom,
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(
-                editing == null ? translate('Add') : translate('Edit'),
-                style: Theme.of(sheetContext).textTheme.titleLarge,
-              ),
-              const SizedBox(height: 16),
-              TextField(
-                controller: note,
-                decoration: InputDecoration(
-                  labelText: translate('Note'),
-                  hintText: translate('input note here'),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: localPort,
-                autofocus: editing == null,
-                keyboardType: TextInputType.number,
-                inputFormatters: [
-                  FilteringTextInputFormatter.digitsOnly,
-                ],
-                decoration: InputDecoration(
-                  labelText: translate('Local Port'),
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: remoteHost,
-                decoration: InputDecoration(
-                  labelText: translate('Remote Host'),
-                  hintText: '192.168.1.100',
-                ),
-              ),
-              const SizedBox(height: 12),
-              TextField(
-                controller: remotePort,
-                keyboardType: TextInputType.number,
-                inputFormatters: [
-                  FilteringTextInputFormatter.digitsOnly,
-                ],
-                decoration: InputDecoration(
-                  labelText: translate('Remote Port'),
-                ),
-              ),
-              const SizedBox(height: 20),
-              SizedBox(
-                width: double.infinity,
-                height: 46,
-                child: ElevatedButton(
-                  onPressed: () {
-                    final lp = int.tryParse(localPort.text.trim());
-                    final host = remoteHost.text.trim();
-                    final rp = int.tryParse(remotePort.text.trim());
-
-                    if (lp == null || lp < 1024 || lp > 65535) {
-                      _sheetError(
-                        sheetContext,
-                        'Local port must be between 1024 and 65535.',
-                      );
-                      return;
-                    }
-                    if (host.isEmpty) {
-                      _sheetError(sheetContext, 'Remote host is required.');
-                      return;
-                    }
-                    if (rp == null || rp < 1 || rp > 65535) {
-                      _sheetError(
-                        sheetContext,
-                        'Remote port must be between 1 and 65535.',
-                      );
-                      return;
-                    }
-
-                    final duplicate = _forwards.asMap().entries.any(
-                          (entry) =>
-                              entry.key != index &&
-                              entry.value.localPort == lp,
+        return SafeArea(
+          top: false,
+          child: SingleChildScrollView(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              4,
+              20,
+              20 + MediaQuery.of(sheetContext).viewInsets.bottom,
+            ),
+            child: Form(
+              key: formKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    editing == null ? translate('Add') : translate('Edit'),
+                    style: Theme.of(sheetContext).textTheme.titleLarge,
+                  ),
+                  const SizedBox(height: 16),
+                  TextFormField(
+                    controller: note,
+                    textInputAction: TextInputAction.next,
+                    decoration: InputDecoration(
+                      labelText: translate('Note'),
+                      hintText: translate('input note here'),
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: localPort,
+                    autofocus: editing == null,
+                    keyboardType: TextInputType.number,
+                    textInputAction: TextInputAction.next,
+                    autovalidateMode: AutovalidateMode.onUserInteraction,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    decoration: InputDecoration(
+                      labelText: translate('Local Port'),
+                      helperText: translate('Range: 1024-65535'),
+                    ),
+                    validator: (value) {
+                      final lp = int.tryParse(value?.trim() ?? '');
+                      if (lp == null || lp < 1024 || lp > 65535) {
+                        return translate(
+                          'Local port must be between 1024 and 65535.',
                         );
-                    if (duplicate) {
-                      _sheetError(
-                        sheetContext,
-                        'Local port $lp is already configured.',
-                      );
-                      return;
-                    }
-
-                    Navigator.of(sheetContext).pop(
-                      _TunnelForward(
-                        localPort: lp,
-                        remoteHost: host,
-                        remotePort: rp,
-                        note: note.text.trim(),
+                      }
+                      final duplicate = _forwards.asMap().entries.any(
+                            (entry) =>
+                                entry.key != index &&
+                                entry.value.localPort == lp,
+                          );
+                      if (duplicate) {
+                        return '${translate('Local port is already configured')}: $lp';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: remoteHost,
+                    textInputAction: TextInputAction.next,
+                    autovalidateMode: AutovalidateMode.onUserInteraction,
+                    decoration: InputDecoration(
+                      labelText: translate('Remote Host'),
+                      hintText: '192.168.1.100',
+                    ),
+                    validator: (value) {
+                      if ((value ?? '').trim().isEmpty) {
+                        return translate('Remote host is required.');
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  TextFormField(
+                    controller: remotePort,
+                    keyboardType: TextInputType.number,
+                    textInputAction: TextInputAction.done,
+                    autovalidateMode: AutovalidateMode.onUserInteraction,
+                    inputFormatters: [
+                      FilteringTextInputFormatter.digitsOnly,
+                    ],
+                    decoration: InputDecoration(
+                      labelText: translate('Remote Port'),
+                      helperText: translate('Range: 1-65535'),
+                    ),
+                    validator: (value) {
+                      final rp = int.tryParse(value?.trim() ?? '');
+                      if (rp == null || rp < 1 || rp > 65535) {
+                        return translate(
+                          'Remote port must be between 1 and 65535.',
+                        );
+                      }
+                      return null;
+                    },
+                    onFieldSubmitted: (_) {
+                      if (formKey.currentState?.validate() == true) {
+                        Navigator.of(sheetContext).pop(
+                          _TunnelForward(
+                            localPort: int.parse(localPort.text.trim()),
+                            remoteHost: remoteHost.text.trim(),
+                            remotePort: int.parse(remotePort.text.trim()),
+                            note: note.text.trim(),
+                          ),
+                        );
+                      }
+                    },
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 46,
+                    child: ElevatedButton(
+                      onPressed: () {
+                        if (formKey.currentState?.validate() != true) {
+                          return;
+                        }
+                        Navigator.of(sheetContext).pop(
+                          _TunnelForward(
+                            localPort: int.parse(localPort.text.trim()),
+                            remoteHost: remoteHost.text.trim(),
+                            remotePort: int.parse(remotePort.text.trim()),
+                            note: note.text.trim(),
+                          ),
+                        );
+                      },
+                      child: Text(
+                        editing == null ? translate('Add') : translate('Save'),
                       ),
-                    );
-                  },
-                  child: Text(editing == null ? translate('Add') : 'Save'),
-                ),
+                    ),
+                  ),
+                ],
               ),
-            ],
+            ),
           ),
         );
       },
@@ -980,16 +1109,10 @@ class _TunnelPageState extends State<TunnelPage> {
     _saveTunnelNotesForPeer(_peerId.text.replaceAll(' ', '').trim());
   }
 
-  void _sheetError(BuildContext context, String text) {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(text)),
-    );
-  }
-
   Future<void> _start() async {
     final peer = _peerId.text.replaceAll(' ', '').trim();
     if (peer.isEmpty) {
-      _error('RustDesk ID is required.');
+      _error(translate('RustDesk ID is required.'));
       return;
     }
     // A manually typed saved ID may not have been submitted yet. If there is
@@ -1002,7 +1125,7 @@ class _TunnelPageState extends State<TunnelPage> {
       }
     }
     if (_forwards.isEmpty) {
-      _error('Add at least one port forward.');
+      _error(translate('Add at least one port forward.'));
       return;
     }
 
@@ -1018,13 +1141,13 @@ class _TunnelPageState extends State<TunnelPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Tunnel is listening on ${_forwards.length} local port(s).',
+              translate('Tunnel started'),
             ),
           ),
         );
       }
     } catch (e) {
-      _error('Failed to start tunnel: $e');
+      _error('${translate('Failed to start tunnel')}: $e');
     } finally {
       if (mounted) {
         setState(() => _working = false);
@@ -1060,7 +1183,7 @@ class _TunnelPageState extends State<TunnelPage> {
     await Clipboard.setData(ClipboardData(text: url));
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Local URL copied')),
+      SnackBar(content: Text(translate('Local URL copied'))),
     );
   }
 
