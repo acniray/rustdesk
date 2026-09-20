@@ -1691,6 +1691,15 @@ pub trait InvokeUiSession: Send + Sync + Clone + 'static + Sized + Default {
     fn close_success(&self);
     fn update_quality_status(&self, qs: QualityStatus);
     fn set_connection_type(&self, is_secured: bool, direct: bool, stream_type: &str);
+    fn update_port_forward_status(
+        &self,
+        _is_secured: bool,
+        _direct: bool,
+        _stream_type: &str,
+        _mux: bool,
+        _peer_version: &str,
+    ) {
+    }
     fn set_fingerprint(&self, fingerprint: String);
     fn job_error(&self, id: i32, err: String, file_num: i32);
     fn job_done(&self, id: i32, file_num: i32);
@@ -1786,6 +1795,23 @@ impl<T: InvokeUiSession> Interface for Session<T> {
 
     fn set_multiple_windows_session(&self, sessions: Vec<WindowsSession>) {
         self.ui_handler.set_multiple_windows_session(sessions);
+    }
+
+    fn update_port_forward_status(
+        &self,
+        is_secured: bool,
+        direct: bool,
+        stream_type: &str,
+        mux: bool,
+        peer_version: &str,
+    ) {
+        self.ui_handler.update_port_forward_status(
+            is_secured,
+            direct,
+            stream_type,
+            mux,
+            peer_version,
+        );
     }
 
     fn handle_peer_info(&self, mut pi: PeerInfo) {

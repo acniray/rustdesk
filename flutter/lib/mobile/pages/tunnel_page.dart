@@ -11,15 +11,71 @@ import 'home_page.dart';
 
 final _androidTunnelController = AndroidTunnelController();
 
-class AndroidTunnelController {
+class AndroidTunnelController extends ChangeNotifier {
   FFI? _ffi;
   bool running = false;
   String peerId = '';
   String remoteHost = '';
   int remotePort = 0;
   int localPort = 0;
+  bool? secure;
+  bool? direct;
+  bool? mux;
+  String streamType = '';
+  String peerVersion = '';
 
   String get localUrl => localPort > 0 ? 'http://127.0.0.1:$localPort' : '';
+
+  String get connectionLabel =>
+      mux == null ? 'Waiting for traffic' : 'Connected';
+
+  String get encryptionLabel {
+    if (mux == null) return 'Pending';
+    if (secure != true) return 'Insecure';
+    return mux == true ? 'E2EE' : 'Legacy / raw';
+  }
+
+  String get tunnelModeLabel =>
+      mux == null ? 'Pending' : (mux == true ? 'MUX' : 'Legacy');
+
+  String get transportLabel {
+    if (direct == null) return 'Pending';
+    final path = direct == true ? 'Direct' : 'Relay';
+    return streamType.isEmpty ? path : '$path ($streamType)';
+  }
+
+  bool get hasSecurityWarning =>
+      mux == false || (mux != null && secure != true);
+
+  String get securityWarning {
+    if (secure != true && mux != null) {
+      return 'The RustDesk session is not end-to-end encrypted.';
+    }
+    if (mux == false) {
+      return 'Legacy forwarding is active. TCP payload leaves the RustDesk '
+          'encrypted session after login.';
+    }
+    return '';
+  }
+
+  void _syncStatus() {
+    final model = _ffi?.ffiModel;
+    if (model == null) return;
+    secure = model.secure;
+    direct = model.direct;
+    mux = model.portForwardMux;
+    streamType = model.cachedPeerData.streamType;
+    peerVersion = model.portForwardPeerVersion;
+    notifyListeners();
+  }
+
+  void _resetStatus() {
+    secure = null;
+    direct = null;
+    mux = null;
+    streamType = '';
+    peerVersion = '';
+  }
 
   Future<void> start({
     required String peerId,
@@ -34,6 +90,8 @@ class AndroidTunnelController {
 
     final ffi = FFI(null, forceUniqueSession: true);
     _ffi = ffi;
+    _resetStatus();
+    ffi.ffiModel.addListener(_syncStatus);
     this.peerId = peerId;
     this.remoteHost = remoteHost;
     this.remotePort = remotePort;
@@ -83,6 +141,7 @@ class AndroidTunnelController {
         throw StateError('Unable to start Android tunnel service');
       }
       running = true;
+      notifyListeners();
     } catch (_) {
       await _closeSession();
       rethrow;
@@ -106,12 +165,15 @@ class AndroidTunnelController {
     remoteHost = '';
     remotePort = 0;
     localPort = 0;
+    _resetStatus();
+    notifyListeners();
   }
 
   Future<void> _closeSession() async {
     final ffi = _ffi;
     _ffi = null;
     if (ffi != null) {
+      ffi.ffiModel.removeListener(_syncStatus);
       try {
         await ffi.close();
       } catch (e) {
@@ -163,10 +225,18 @@ class _TunnelPageState extends State<TunnelPage> {
       _remoteHost.text = _androidTunnelController.remoteHost;
       _remotePort.text = _androidTunnelController.remotePort.toString();
     }
+    _androidTunnelController.addListener(_onTunnelStatusChanged);
+  }
+
+  void _onTunnelStatusChanged() {
+    if (mounted) {
+      setState(() {});
+    }
   }
 
   @override
   void dispose() {
+    _androidTunnelController.removeListener(_onTunnelStatusChanged);
     _peerId.dispose();
     _password.dispose();
     _localPort.dispose();
@@ -272,6 +342,43 @@ class _TunnelPageState extends State<TunnelPage> {
                     '${_androidTunnelController.remotePort} via '
                     '${_androidTunnelController.peerId}',
                   ),
+                  const Divider(height: 24),
+                  _statusRow(
+                    'Connection',
+                    _androidTunnelController.connectionLabel,
+                  ),
+                  _statusRow(
+                    'Encryption',
+                    _androidTunnelController.encryptionLabel,
+                  ),
+                  _statusRow(
+                    'Tunnel mode',
+                    _androidTunnelController.tunnelModeLabel,
+                  ),
+                  _statusRow(
+                    'Transport',
+                    _androidTunnelController.transportLabel,
+                  ),
+                  if (_androidTunnelController.peerVersion.isNotEmpty)
+                    _statusRow(
+                      'Peer version',
+                      _androidTunnelController.peerVersion,
+                    ),
+                  if (_androidTunnelController.hasSecurityWarning) ...[
+                    const SizedBox(height: 10),
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Icon(Icons.warning_amber_rounded),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _androidTunnelController.securityWarning,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -317,6 +424,24 @@ class _TunnelPageState extends State<TunnelPage> {
           'phone through http://127.0.0.1:18080.',
         ),
       ],
+    );
+  }
+
+  Widget _statusRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 4),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 105,
+            child: Text(
+              label,
+              style: const TextStyle(fontWeight: FontWeight.w600),
+            ),
+          ),
+          Expanded(child: SelectableText(value)),
+        ],
+      ),
     );
   }
 

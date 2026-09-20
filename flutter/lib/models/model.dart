@@ -118,6 +118,8 @@ class FfiModel with ChangeNotifier {
   final _permissions = <String, bool>{};
   bool? _secure;
   bool? _direct;
+  bool? _portForwardMux;
+  String _portForwardPeerVersion = '';
   bool _touchMode = false;
   late VirtualMouseMode virtualMouseMode;
   Timer? _timer;
@@ -155,6 +157,10 @@ class FfiModel with ChangeNotifier {
   bool? get secure => _secure;
 
   bool? get direct => _direct;
+
+  bool? get portForwardMux => _portForwardMux;
+
+  String get portForwardPeerVersion => _portForwardPeerVersion;
 
   PeerInfo get pi => _pi;
 
@@ -255,6 +261,8 @@ class FfiModel with ChangeNotifier {
     _cancelPendingMonitorRestore();
     _secure = null;
     _direct = null;
+    _portForwardMux = null;
+    _portForwardPeerVersion = '';
     _inputBlocked = false;
     _timer?.cancel();
     _timer = null;
@@ -353,6 +361,12 @@ class FfiModel with ChangeNotifier {
         setConnectionType(peerId, evt['secure'] == 'true',
             evt['direct'] == 'true', evt['stream_type'] ?? '');
         resetRestartReconnectState();
+      } else if (name == 'port_forward_status') {
+        setConnectionType(peerId, evt['secure'] == 'true',
+            evt['direct'] == 'true', evt['stream_type'] ?? '');
+        _portForwardMux = evt['mux'] == 'true';
+        _portForwardPeerVersion = evt['peer_version'] ?? '';
+        notifyListeners();
       } else if (name == 'switch_display') {
         // switch display is kept for backward compatibility
         handleSwitchDisplay(evt, sessionId, peerId);
