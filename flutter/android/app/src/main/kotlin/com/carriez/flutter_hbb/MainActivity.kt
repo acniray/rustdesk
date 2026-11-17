@@ -260,11 +260,14 @@ class MainActivity : FlutterActivity() {
         // MainService, or the accessibility InputService on its own. Only the
         // former gets onTaskRemoved, so close outgoing sessions here too,
         // otherwise a session survives with no UI left to close it.
-        // `isFinishing` distinguishes the user really leaving from a destroy
-        // for recreation (configuration change, "don't keep activities"),
-        // which must not tear down a live session.
-        if (isFinishing) {
+        // A user-started TCP tunnel is intentionally allowed to outlive the
+        // Flutter Activity. Switching apps, pressing Back, or removing the UI
+        // must not tear down the native port-forward listener while its
+        // foreground service is active.
+        if (isFinishing && !TunnelService.isRunning) {
             FFI.closeAllSessions()
+        } else if (isFinishing) {
+            Log.d(logTag, "Activity finished while tunnel service is active; keeping sessions alive")
         }
         mainService?.let {
             unbindService(serviceConnection)
@@ -290,6 +293,23 @@ class MainActivity : FlutterActivity() {
             if (documentPicker.handle(call, result)) return@setMethodCallHandler
             // make sure result will be invoked, otherwise flutter will await forever
             when (call.method) {
+                "start_tunnel_service" -> {
+                    val args = call.arguments as? Map<*, *>
+                    val description = args?.get("description")?.toString().orEmpty()
+                    val intent = Intent(activity, TunnelService::class.java).apply {
+                        putExtra("description", description)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        startForegroundService(intent)
+                    } else {
+                        startService(intent)
+                    }
+                    result.success(true)
+                }
+                "stop_tunnel_service" -> {
+                    stopService(Intent(activity, TunnelService::class.java))
+                    result.success(true)
+                }
                 "init_service" -> {
                     Intent(activity, MainService::class.java).also {
                         bindService(it, serviceConnection, Context.BIND_AUTO_CREATE)
@@ -1025,7 +1045,15 @@ class MainActivity : FlutterActivity() {
     override fun onStop() {
         super.onStop()
         val disableFloatingWindow = FFI.getLocalOption("disable-floating-window") == "Y"
-        if (!disableFloatingWindow && MainService.isReady) {
+        // The controlled-side host keeps a visible overlay while the Activity is
+        // backgrounded. Give an active TCP tunnel the same treatment so Android
+        // keeps the process at the same importance class instead of treating the
+        // tunnel as a foreground-service-only background process.
+        if (!disableFloatingWindow && (MainService.isReady || TunnelService.isRunning)) {
+            Log.d(
+                logTag,
+                "onStop, starting floating window; hostReady=${MainService.isReady}, tunnel=${TunnelService.isRunning}"
+            )
             startService(Intent(this, FloatingWindowService::class.java))
         }
     }
