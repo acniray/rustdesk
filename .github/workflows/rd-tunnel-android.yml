@@ -1,0 +1,17 @@
+# Registers the manual Build RD Tunnel Android action in GitHub's default branch.
+# The real Android tunnel build workflow lives in feature branches at this path.
+# Select "feature/android-tcp-tunnel-1.5.3" under Run workflow to build the APK.
+name: Build RD Tunnel Android
+
+on:
+  workflow_dispatch:
+
+jobs:
+  choose-tunnel-branch:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Explain branch selection
+        run: |
+          echo "::error::The master branch has no Android TCP tunnel implementation."
+          echo "::error::Choose feature/android-tcp-tunnel-1.5.3 from the Run workflow branch selector."
+          exit 1
