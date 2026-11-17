@@ -1,5 +1,5 @@
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use crate::clipboard::{update_clipboard, ClipboardSide};
+use crate::clipboard::{clipboard_listener, update_clipboard, ClipboardSide};
 #[cfg(not(any(target_os = "ios")))]
 use crate::{audio_service, clipboard::CLIPBOARD_INTERVAL, ConnInner, CLIENT_SERVER};
 use crate::{
@@ -61,7 +61,7 @@ use hbb_common::{
 use hbb_common::{tokio::sync::Mutex as TokioMutex, ResultType};
 use scrap::CodecFormat;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::c_void,
     num::NonZeroI64,
     path::PathBuf,
@@ -84,7 +84,12 @@ pub struct Remote<T: InvokeUiSession> {
     remove_jobs: HashMap<i32, RemoveJob>,
     timer: crate::RustDeskInterval,
     last_update_jobs_status: (Instant, HashMap<i32, u64>),
+    // Set after PeerInfo for this round, not when the transport connects.
     is_connected: bool,
+    // Whether the scheduled initial snapshot may still be sent.
+    // The connection loop clears this when handling its result or a live clipboard update.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    initial_clipboard_pending: bool,
     first_frame: bool,
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     client_conn_id: i32, // used for file clipboard
@@ -93,9 +98,12 @@ pub struct Remote<T: InvokeUiSession> {
     elevation_requested: bool,
     peer_info: ParsedPeerInfo,
     video_threads: HashMap<usize, VideoThread>,
+    last_auto_fps: Option<usize>,
     chroma: Arc<RwLock<Option<Chroma>>>,
     last_record_state: bool,
     sent_close_reason: bool,
+    cursor_dedupe: CursorDedupe,
+    trusted_device: crate::trusted_devices::client::Session,
 }
 
 #[derive(Default)]
@@ -132,6 +140,8 @@ impl<T: InvokeUiSession> Remote<T> {
             timer: crate::rustdesk_interval(time::interval(SEC30)),
             last_update_jobs_status: (Instant::now(), Default::default()),
             is_connected: false,
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            initial_clipboard_pending: false,
             first_frame: false,
             #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
             client_conn_id: 0,
@@ -142,9 +152,12 @@ impl<T: InvokeUiSession> Remote<T> {
             elevation_requested: false,
             peer_info: Default::default(),
             video_threads: Default::default(),
+            last_auto_fps: None,
             chroma: Default::default(),
             last_record_state: false,
             sent_close_reason: false,
+            cursor_dedupe: Default::default(),
+            trusted_device: Default::default(),
         }
     }
 
@@ -198,6 +211,22 @@ impl<T: InvokeUiSession> Remote<T> {
                     .unwrap()
                     .set_connected();
                 let is_secured = peer.is_secured();
+                let trust = crate::trusted_devices::client::Session::new(
+                    &self.handler.lc.read().unwrap(),
+                    is_secured,
+                    pk.as_deref(),
+                );
+                match trust {
+                    Ok(trust) => {
+                        self.trusted_device = trust;
+                        self.handler.lc.write().unwrap().enable_trusted_devices = false;
+                    }
+                    Err(error) => {
+                        self.handler.on_error(&error.to_string());
+                        self.handle_disconnected(round);
+                        return;
+                    }
+                }
                 // Only WebRTC needs refining: its label names the transport that won the race,
                 // not the family ICE ended up nominating, and it is the one path where the two
                 // can disagree with the address the rendezvous observed.
@@ -373,7 +402,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.frame_count.write().unwrap() = 0;
                             });
-                            self.fps_control(direct, fps.clone());
+                            self.fps_control(direct, fps.clone(), &mut peer).await;
                             let chroma = self.chroma.read().unwrap().clone();
                             let chroma = match chroma {
                                 Some(Chroma::I444) => "4:4:4",
@@ -419,6 +448,19 @@ impl<T: InvokeUiSession> Remote<T> {
             }
         }
         self.handle_disconnected(round);
+        #[cfg(target_os = "android")]
+        for job in &mut self.write_jobs {
+            if let Err(error) = job.cancel_document().await {
+                const CLEANUP_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+                hbb_common::throttled_log!(
+                    CLEANUP_ERROR_LOG_INTERVAL,
+                    warn,
+                    "Failed to clean up document transfer {} on disconnect: {}",
+                    job.id(),
+                    error
+                );
+            }
+        }
     }
 
     fn handle_disconnected(&self, round: u32) {
@@ -432,6 +474,11 @@ impl<T: InvokeUiSession> Remote<T> {
 
         #[cfg(not(target_os = "ios"))]
         if self.handler.is_default() && _set_disconnected_ok {
+            // Other sessions may keep the listener running after this one disconnects.
+            #[cfg(feature = "flutter")]
+            crate::flutter::update_text_clipboard_required();
+            #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
+            crate::flutter::update_file_clipboard_required();
             Client::try_stop_clipboard();
         }
 
@@ -445,7 +492,7 @@ impl<T: InvokeUiSession> Remote<T> {
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     async fn handle_local_clipboard_msg(
-        &self,
+        &mut self,
         peer: &mut Stream,
         msg: Option<clipboard::ClipboardFile>,
     ) {
@@ -458,6 +505,10 @@ impl<T: InvokeUiSession> Remote<T> {
                 } => {
                     self.handler.msgbox(&r#type, &title, &text, "");
                 }
+                // File-data responses bypass is_stopping_allowed, but still require login.
+                _ if !self.is_connected => {
+                    log::debug!("Discarding local file clipboard message before login");
+                }
                 _ => {
                     let is_stopping_allowed = clip.is_stopping_allowed();
                     let server_file_transfer_enabled =
@@ -466,9 +517,7 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.handler.lc.read().unwrap().enable_file_copy_paste.v;
                     let view_only = self.handler.lc.read().unwrap().view_only.v;
                     let stop = is_stopping_allowed
-                        && (view_only
-                            || !self.is_connected
-                            || !(server_file_transfer_enabled && file_transfer_enabled));
+                        && (view_only || !(server_file_transfer_enabled && file_transfer_enabled));
                     log::debug!(
                         "Process clipboard message from system, view_only: {}, stop: {}, is_stopping_allowed: {}, server_file_transfer_enabled: {}, file_transfer_enabled: {}",
                         view_only, stop, is_stopping_allowed, server_file_transfer_enabled, file_transfer_enabled
@@ -485,6 +534,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             // to-do: Show msgbox with "Don't show again" option
                         };
                         log::debug!("Send system clipboard message to remote");
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        if matches!(&clip, clipboard::ClipboardFile::FormatList { .. }) {
+                            self.initial_clipboard_pending = false;
+                        }
                         let msg = crate::clipboard_file::clip_2_msg(clip);
                         allow_err!(peer.send(&msg).await);
                     }
@@ -625,6 +678,82 @@ impl<T: InvokeUiSession> Remote<T> {
         self.sent_close_reason = true;
     }
 
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn start_initial_clipboard_sync(&mut self) {
+        let peer_info = {
+            let lc = self.handler.lc.read().unwrap();
+            lc.peer_info
+                .as_ref()
+                .map(|pi| (pi.version.clone(), pi.platform.clone()))
+        };
+        let Some((peer_version, peer_platform)) = peer_info else {
+            log::error!("Cannot start initial clipboard sync without peer information");
+            return;
+        };
+
+        self.initial_clipboard_pending = true;
+        let sender = self.sender.clone();
+        let permission_config = self.handler.get_permission_config();
+        // Clipboard access and encoding must not block the connection loop.
+        let read_clipboard = move || {
+            // Capture after readiness, before reading; later changes invalidate this snapshot.
+            let generation = clipboard_listener::current_generation();
+            let msg_out = if permission_config.is_text_clipboard_required() {
+                crate::clipboard::get_current_clipboard_msg(
+                    &peer_version,
+                    &peer_platform,
+                    crate::clipboard::ClipboardSide::Client,
+                )
+            } else {
+                None
+            };
+            let msg_out = msg_out.filter(|_| permission_config.is_text_clipboard_required());
+            // Empty or failed reads must also finish the pending initial-sync attempt.
+            if let Err(err) = sender.send(Data::InitialClipboard(generation, msg_out)) {
+                log::debug!("Failed to send initial clipboard result: {}", err);
+            }
+        };
+        #[cfg(target_os = "linux")]
+        self.spawn_initial_clipboard_read_after_ready(read_clipboard);
+        #[cfg(not(target_os = "linux"))]
+        tokio::task::spawn_blocking(read_clipboard);
+    }
+
+    // Linux listener creation returns before X11/Wayland has subscribed to changes.
+    // Capture after readiness so changes during the read can invalidate the snapshot.
+    // A separate task keeps a stalled backend from blocking the connection loop.
+    #[cfg(target_os = "linux")]
+    fn spawn_initial_clipboard_read_after_ready(&self, read_clipboard: impl FnOnce() + Send + 'static) {
+        // Initial-sync wait budget, not a protocol-defined startup deadline.
+        const CLIPBOARD_READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let ready = tokio::select! {
+                result = time::timeout(CLIPBOARD_READY_TIMEOUT, clipboard_listener::wait_for_ready()) => {
+                    match result {
+                        Ok(ready) => ready,
+                        Err(err) => Err(err.into()),
+                    }
+                }
+                _ = sender.closed() => return,
+            };
+            if let Err(err) = ready {
+                log::error!(
+                    "Failed to wait for clipboard listener readiness (limit {:?}): {}",
+                    CLIPBOARD_READY_TIMEOUT,
+                    err,
+                );
+                let generation = clipboard_listener::current_generation();
+                if let Err(err) = sender.send(Data::InitialClipboard(generation, None)) {
+                    log::debug!("Failed to send initial clipboard result: {}", err);
+                }
+                return;
+            }
+            tokio::task::spawn_blocking(read_clipboard);
+        });
+    }
+
     async fn handle_msg_from_ui(&mut self, data: Data, peer: &mut Stream) -> bool {
         match data {
             Data::Close => {
@@ -633,16 +762,77 @@ impl<T: InvokeUiSession> Remote<T> {
             }
             Data::Login((os_username, os_password, password, remember)) => {
                 self.handler
-                    .handle_login_from_ui(os_username, os_password, password, remember, peer)
+                    .handle_login_from_ui(
+                        os_username,
+                        os_password,
+                        password,
+                        remember,
+                        &mut self.trusted_device,
+                        peer,
+                    )
                     .await;
             }
             #[cfg(all(target_os = "windows", not(feature = "flutter")))]
             Data::ToggleClipboardFile => {
                 self.check_clipboard_file_context();
             }
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            Data::InitialClipboard(generation, msg) => {
+                // A live update supersedes any initial snapshot still being prepared.
+                if !self.initial_clipboard_pending {
+                    return true;
+                }
+                self.initial_clipboard_pending = false;
+                if !self.handler.is_text_clipboard_required() {
+                    return true;
+                }
+                if generation != clipboard_listener::current_generation() {
+                    // A clipboard change or listener restart can invalidate the snapshot
+                    // without sending a live update that supersedes it.
+                    drop(msg);
+                    self.start_initial_clipboard_sync();
+                    return true;
+                }
+                if let Some(msg) = msg {
+                    allow_err!(peer.send(&msg).await);
+                }
+            }
             Data::Message(msg) => {
+                let msg = self.trusted_device.outgoing(msg);
+                // The Flutter clipboard broadcast is process-wide, so a clipboard can reach this
+                // round's queue before the round has logged in; it is dropped here, on the round
+                // itself.
+                #[cfg(feature = "flutter")]
+                if !self.is_connected
+                    && matches!(
+                        msg.union.as_ref(),
+                        Some(message::Union::Clipboard(_))
+                            | Some(message::Union::MultiClipboards(_))
+                    )
+                {
+                    return true;
+                }
                 match &msg.union {
+                    Some(message::Union::Cliprdr(_)) if !self.is_connected => {
+                        log::debug!("Discarding outgoing file clipboard message before login");
+                        return true;
+                    }
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    Some(message::Union::Clipboard(_)) | Some(message::Union::MultiClipboards(_)) => {
+                        self.initial_clipboard_pending = false;
+                    }
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    Some(message::Union::Cliprdr(clip))
+                        if matches!(clip.union.as_ref(), Some(cliprdr::Union::FormatList(_))) =>
+                    {
+                        self.initial_clipboard_pending = false;
+                    }
                     Some(message::Union::Misc(misc)) => match misc.union {
+                        Some(misc::Union::Option(ref option)) => {
+                            if option.custom_fps > 0 {
+                                self.last_auto_fps = None;
+                            }
+                        }
                         Some(misc::Union::RefreshVideo(_)) => {
                             self.video_threads.iter().for_each(|(_, v)| {
                                 *v.discard_queue.write().unwrap() = true;
@@ -665,7 +855,16 @@ impl<T: InvokeUiSession> Remote<T> {
                 if is_remote {
                     log::debug!("New job {}, write to {} from remote {}", id, to, path);
                     let to = match r#type {
-                        fs::JobType::Generic => fs::DataSource::FilePath(PathBuf::from(&to)),
+                        fs::JobType::Generic => {
+                            if let Err(err) = fs::download::validate_download_name(
+                                &path,
+                                self.handler.peer_platform() == "Windows",
+                            ) {
+                                self.handle_job_status(id, -1, Some(err.to_string()));
+                                return true;
+                            }
+                            fs::DataSource::FilePath(PathBuf::from(&to))
+                        }
                         fs::JobType::Printer => {
                             fs::DataSource::MemoryCursor(std::io::Cursor::new(Vec::new()))
                         }
@@ -685,7 +884,33 @@ impl<T: InvokeUiSession> Remote<T> {
                             .await
                     );
                 } else {
-                    match fs::TransferJob::new_read(
+                    #[cfg(target_os = "android")]
+                    let result = {
+                        let source = fs::DataSource::FilePath(PathBuf::from(&path));
+                        let destination = to.clone();
+                        let read = move || {
+                            fs::TransferJob::new_read(
+                                id,
+                                r#type,
+                                destination,
+                                source,
+                                file_num,
+                                include_hidden,
+                                is_remote,
+                                od,
+                            )
+                        };
+                        if fs::android::is_path(path.as_ref()) {
+                            tokio::task::spawn_blocking(read)
+                                .await
+                                .map_err(hbb_common::anyhow::Error::from)
+                                .and_then(|result| result)
+                        } else {
+                            read()
+                        }
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let result = fs::TransferJob::new_read(
                         id,
                         r#type,
                         to.clone(),
@@ -694,7 +919,8 @@ impl<T: InvokeUiSession> Remote<T> {
                         include_hidden,
                         is_remote,
                         od,
-                    ) {
+                    );
+                    match result {
                         Err(err) => {
                             self.handle_job_status(id, -1, Some(err.to_string()));
                         }
@@ -755,7 +981,33 @@ impl<T: InvokeUiSession> Remote<T> {
                     job.is_last_job = true;
                     self.write_jobs.push(job);
                 } else {
-                    match fs::TransferJob::new_read(
+                    #[cfg(target_os = "android")]
+                    let result = {
+                        let source = fs::DataSource::FilePath(PathBuf::from(&path));
+                        let destination = to.clone();
+                        let read = move || {
+                            fs::TransferJob::new_read(
+                                id,
+                                r#type,
+                                destination,
+                                source,
+                                file_num,
+                                include_hidden,
+                                is_remote,
+                                od,
+                            )
+                        };
+                        if fs::android::is_path(path.as_ref()) {
+                            tokio::task::spawn_blocking(read)
+                                .await
+                                .map_err(hbb_common::anyhow::Error::from)
+                                .and_then(|result| result)
+                        } else {
+                            read()
+                        }
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let result = fs::TransferJob::new_read(
                         id,
                         r#type,
                         to.clone(),
@@ -764,7 +1016,8 @@ impl<T: InvokeUiSession> Remote<T> {
                         include_hidden,
                         is_remote,
                         od,
-                    ) {
+                    );
+                    match result {
                         Err(err) => {
                             self.handle_job_status(id, -1, Some(err.to_string()));
                         }
@@ -916,7 +1169,21 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.remove_jobs
                         .insert(id, RemoveJob::new(Vec::new(), path, sep, is_remote));
                 } else {
-                    match fs::get_recursive_files(&path, include_hidden) {
+                    #[cfg(target_os = "android")]
+                    let result = if fs::android::is_path(path.as_ref()) {
+                        let path = path.clone();
+                        tokio::task::spawn_blocking(move || {
+                            fs::get_recursive_files(&path, include_hidden)
+                        })
+                        .await
+                        .map_err(hbb_common::anyhow::Error::from)
+                        .and_then(|result| result)
+                    } else {
+                        fs::get_recursive_files(&path, include_hidden)
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let result = fs::get_recursive_files(&path, include_hidden);
+                    match result {
                         Ok(entries) => {
                             self.handler.update_folder_files(
                                 id,
@@ -962,7 +1229,18 @@ impl<T: InvokeUiSession> Remote<T> {
                     msg_out.set_file_action(file_action);
                     allow_err!(peer.send(&msg_out).await);
                 } else {
-                    match fs::remove_file(&path) {
+                    #[cfg(target_os = "android")]
+                    let result = if fs::android::is_path(path.as_ref()) {
+                        tokio::task::spawn_blocking(move || fs::remove_file(&path))
+                            .await
+                            .map_err(hbb_common::anyhow::Error::from)
+                            .and_then(|result| result)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let result = fs::remove_file(&path);
+                    match result {
                         Err(err) => {
                             self.handle_job_status(id, file_num, Some(err.to_string()));
                         }
@@ -984,7 +1262,18 @@ impl<T: InvokeUiSession> Remote<T> {
                     msg_out.set_file_action(file_action);
                     allow_err!(peer.send(&msg_out).await);
                 } else {
-                    match fs::create_dir(&path) {
+                    #[cfg(target_os = "android")]
+                    let result = if fs::android::is_path(path.as_ref()) {
+                        tokio::task::spawn_blocking(move || fs::create_dir(&path))
+                            .await
+                            .map_err(hbb_common::anyhow::Error::from)
+                            .and_then(|result| result)
+                    } else {
+                        fs::create_dir(&path)
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let result = fs::create_dir(&path);
+                    match result {
                         Err(err) => {
                             self.handle_job_status(id, -1, Some(err.to_string()));
                         }
@@ -1007,6 +1296,18 @@ impl<T: InvokeUiSession> Remote<T> {
                     msg_out.set_file_action(file_action);
                     allow_err!(peer.send(&msg_out).await);
                 } else {
+                    #[cfg(target_os = "android")]
+                    let err = if fs::android::is_path(path.as_ref()) {
+                        tokio::task::spawn_blocking(move || fs::rename_file(&path, &new_name))
+                            .await
+                            .map_err(hbb_common::anyhow::Error::from)
+                            .and_then(|result| result)
+                    } else {
+                        fs::rename_file(&path, &new_name)
+                    }
+                    .err()
+                    .map(|e| e.to_string());
+                    #[cfg(not(target_os = "android"))]
                     let err = fs::rename_file(&path, &new_name)
                         .err()
                         .map(|e| e.to_string());
@@ -1141,6 +1442,12 @@ impl<T: InvokeUiSession> Remote<T> {
         msg_out.set_file_action(file_action);
         allow_err!(peer.send(&msg_out).await);
         if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
+            #[cfg(target_os = "android")]
+            let mut job = job;
+            #[cfg(target_os = "android")]
+            if let Err(error) = job.cancel_document().await {
+                self.handle_job_status(id, job.file_num(), Some(error.to_string()));
+            }
             job.remove_download_file();
         }
         let _ = fs::remove_job(id, &mut self.read_jobs);
@@ -1233,7 +1540,12 @@ impl<T: InvokeUiSession> Remote<T> {
     // Currently, this function only considers decoding speed and queue length, not network delay.
     // The controlled end can consider auto fps as the maximum decoding fps.
     #[inline]
-    fn fps_control(&mut self, direct: bool, real_fps_map: HashMap<usize, i32>) {
+    async fn fps_control(
+        &mut self,
+        direct: bool,
+        real_fps_map: HashMap<usize, i32>,
+        peer: &mut Stream,
+    ) {
         self.video_threads.iter_mut().for_each(|(k, v)| {
             let real_fps = real_fps_map.get(k).cloned().unwrap_or_default();
             if real_fps == 0 {
@@ -1273,7 +1585,7 @@ impl<T: InvokeUiSession> Remote<T> {
         if limited_fps > custom_fps {
             limited_fps = custom_fps;
         }
-        let last_auto_fps = self.handler.lc.read().unwrap().last_auto_fps.clone();
+        let last_auto_fps = self.last_auto_fps;
         let displays = self.video_threads.keys().cloned().collect::<Vec<_>>();
         let mut fps_trending = |display: usize| {
             let thread = self.video_threads.get_mut(&display)?;
@@ -1319,9 +1631,10 @@ impl<T: InvokeUiSession> Remote<T> {
                 });
                 let mut msg = Message::new();
                 msg.set_misc(misc);
-                self.sender.send(Data::Message(msg)).ok();
+                // Send inline so a queued manual FPS update is applied after this decision.
+                allow_err!(peer.send(&msg).await);
                 log::info!("Set fps to {}", auto_fps);
-                self.handler.lc.write().unwrap().last_auto_fps = Some(auto_fps);
+                self.last_auto_fps = Some(auto_fps);
             }
         }
         // send refresh
@@ -1418,18 +1731,24 @@ impl<T: InvokeUiSession> Remote<T> {
                 Some(message::Union::Hash(hash)) => {
                     if !self
                         .handler
-                        .handle_hash(&self.handler.password.clone(), hash, peer)
+                        .handle_hash(
+                            &self.handler.password.clone(),
+                            hash,
+                            &mut self.trusted_device,
+                            peer,
+                        )
                         .await
                     {
                         return false;
                     }
                 }
-                Some(message::Union::LoginResponse(lr)) => match lr.union {
+                Some(message::Union::LoginResponse(lr)) => match self
+                    .trusted_device
+                    .respond(lr, &self.handler)
+                    .await
+                    .union
+                {
                     Some(login_response::Union::Error(err)) => {
-                        if err == client::REQUIRE_2FA {
-                            self.handler.lc.write().unwrap().enable_trusted_devices =
-                                lr.enable_trusted_devices;
-                        }
                         if !self.handler.handle_login_error(&err) {
                             return false;
                         }
@@ -1454,6 +1773,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         #[cfg(all(target_os = "windows", not(feature = "flutter")))]
                         self.check_clipboard_file_context();
                         if self.handler.is_default() {
+                            // Startup notifications must see the current sessions' clipboard requirements.
+                            #[cfg(feature = "flutter")]
+                            #[cfg(not(target_os = "ios"))]
+                            crate::flutter::update_text_clipboard_required();
+
+                            #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
+                            crate::flutter::update_file_clipboard_required();
+
                             #[cfg(feature = "flutter")]
                             #[cfg(not(target_os = "ios"))]
                             let rx = Client::try_start_clipboard(None);
@@ -1475,31 +1802,18 @@ impl<T: InvokeUiSession> Remote<T> {
                                 timeout(CLIPBOARD_INTERVAL, rx.recv()).await.ok();
                             }
 
+                            // `is_connected`` becomes true after the first PeerInfo.
+                            // Reconnects create a new Remote. Refreshes after a generation change
+                            // use a separate entry point and are not blocked by this guard.
                             #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                            if self.handler.lc.read().unwrap().sync_init_clipboard.v {
-                                if let Some(msg_out) = crate::clipboard::get_current_clipboard_msg(
-                                    &peer_version,
-                                    &peer_platform,
-                                    crate::clipboard::ClipboardSide::Client,
-                                ) {
-                                    let sender = self.sender.clone();
-                                    let permission_config = self.handler.get_permission_config();
-                                    tokio::spawn(async move {
-                                        if permission_config.is_text_clipboard_required() {
-                                            sender.send(Data::Message(msg_out)).ok();
-                                        }
-                                    });
-                                }
+                            if !self.is_connected
+                                && self.handler.is_text_clipboard_required()
+                                && self.handler.lc.read().unwrap().sync_init_clipboard.v
+                            {
+                                self.start_initial_clipboard_sync();
                             }
                             // to-do: Android, is `sync_init_clipboard` really needed?
                             // https://github.com/rustdesk/rustdesk/discussions/9010
-
-                            #[cfg(feature = "flutter")]
-                            #[cfg(not(target_os = "ios"))]
-                            crate::flutter::update_text_clipboard_required();
-
-                            #[cfg(all(feature = "flutter", feature = "unix-file-copy-paste"))]
-                            crate::flutter::update_file_clipboard_required();
                         }
 
                         if self.handler.is_file_transfer() {
@@ -1510,11 +1824,29 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                     _ => {}
                 },
+                Some(message::Union::CursorData(cd)) if self.dedupes_cursors() => {
+                    self.set_cursor_data_by_content(cd);
+                }
+                Some(message::Union::CursorId(id)) if self.dedupes_cursors() => {
+                    self.handler
+                        .set_cursor_id(self.cursor_dedupe.id(id).to_string());
+                }
                 Some(message::Union::CursorData(cd)) => {
                     let id = cd.id;
+                    #[cfg(feature = "flutter")]
+                    let compressed = cd.colors.clone();
                     match decode_cursor_data(cd) {
-                        Ok(cd) => self.handler.set_cursor_data(cd),
-                        Err(err) => log::warn!("Rejected cursor {id}: {err}"),
+                        Ok(cd) => {
+                            #[cfg(feature = "flutter")]
+                            self.keep_cursor_shape(cursor_shape(id, &cd, &compressed));
+                            self.handler.set_cursor_data(cd)
+                        }
+                        Err(err) => {
+                            log::warn!("Rejected cursor {id}: {err}");
+                            // The peer shows it now: selected, the UI treats it as a shape it
+                            // lacks, as it will when the peer selects it again.
+                            self.handler.set_cursor_id(id.to_string());
+                        }
                     }
                 }
                 Some(message::Union::CursorId(id)) => {
@@ -1542,7 +1874,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             crate::flutter::send_clipboard_msg_to_other_sessions(msg, session_id);
                         }
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(vec![cb], ClipboardSide::Client);
+                        {
+                            self.initial_clipboard_pending = false;
+                            update_clipboard(vec![cb], ClipboardSide::Client);
+                        }
                         #[cfg(target_os = "ios")]
                         {
                             let content = if cb.compress {
@@ -1577,7 +1912,10 @@ impl<T: InvokeUiSession> Remote<T> {
                             crate::flutter::send_clipboard_msg_to_other_sessions(msg, session_id);
                         }
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
-                        update_clipboard(_mcb.clipboards, ClipboardSide::Client);
+                        {
+                            self.initial_clipboard_pending = false;
+                            update_clipboard(_mcb.clipboards, ClipboardSide::Client);
+                        }
                         #[cfg(target_os = "ios")]
                         {
                             if let Some(cb) = _mcb
@@ -1617,6 +1955,15 @@ impl<T: InvokeUiSession> Remote<T> {
                             {
                                 if self.handler.peer_platform() == "Windows" {
                                     fs::transform_windows_path(&mut entries);
+                                }
+                            }
+                            if fd.id <= 0 {
+                                if let Err(err) = fs::download::validate_listing(
+                                    &entries,
+                                    self.handler.peer_platform() == "Windows",
+                                ) {
+                                    self.handle_job_status(fd.id, -1, Some(err.to_string()));
+                                    return true;
                                 }
                             }
                             // We cannot call cancel_transfer_job/handle_job_status while holding
@@ -1714,11 +2061,26 @@ impl<T: InvokeUiSession> Remote<T> {
                                                 crate::is_support_file_transfer_resume_num(
                                                     peer_ver,
                                                 );
-                                            match fs::is_write_need_confirmation(
-                                                is_support_resume && job.is_resume,
-                                                &write_path,
-                                                &digest,
-                                            ) {
+                                            #[cfg(target_os = "android")]
+                                            let digest_result = if job.is_document() {
+                                                let path = write_path.clone();
+                                                let digest = digest.clone();
+                                                let resume = is_support_resume && job.is_resume;
+                                                tokio::task::spawn_blocking(move || {
+                                                    fs::is_write_need_confirmation(
+                                                        resume, &path, &digest,
+                                                    )
+                                                })
+                                                .await
+                                                .map_err(hbb_common::anyhow::Error::from)
+                                                .and_then(|result| result)
+                                            } else {
+                                                job.download_digest(is_support_resume, &digest)
+                                            };
+                                            #[cfg(not(target_os = "android"))]
+                                            let digest_result =
+                                                job.download_digest(is_support_resume, &digest);
+                                            match digest_result {
                                                 Ok(res) => match res {
                                                     DigestCheckResult::IsSame => {
                                                         let req = FileTransferSendConfirmRequest {
@@ -1775,13 +2137,19 @@ impl<T: InvokeUiSession> Remote<T> {
                                                         union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
                                                         ..Default::default()
                                                     };
-                                                        job.confirm(&req).await;
+                                                        // This did not approve replacing an existing local file.
                                                         let msg = new_send_confirm(req);
                                                         allow_err!(peer.send(&msg).await);
                                                     }
                                                 },
                                                 Err(err) => {
-                                                    println!("error receiving digest: {}", err);
+                                                    self.cancel_transfer_job(digest.id, peer).await;
+                                                    self.handle_job_status(
+                                                        digest.id,
+                                                        -1,
+                                                        Some(err.to_string()),
+                                                    );
+                                                    return true;
                                                 }
                                             }
                                         }
@@ -1790,13 +2158,18 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         Some(file_response::Union::Block(block)) => {
+                            let id = block.id;
+                            let mut write_error = None;
                             if let Some(job) = fs::get_job(block.id, &mut self.write_jobs) {
-                                if let Err(_err) = job.write(block).await {
-                                    // to-do: add "skip" for writing job
-                                }
+                                let result = job.write(block).await;
                                 if job.r#type == fs::JobType::Generic {
+                                    write_error = result.err().map(|err| err.to_string());
                                     self.update_jobs_status();
                                 }
+                            }
+                            if let Some(err) = write_error {
+                                self.cancel_transfer_job(id, peer).await;
+                                self.handle_job_status(id, -1, Some(err));
                             }
                         }
                         Some(file_response::Union::Done(d)) => {
@@ -1804,8 +2177,17 @@ impl<T: InvokeUiSession> Remote<T> {
                             let mut job_type = fs::JobType::Generic;
                             let mut printer_data = None;
                             if let Some(job) = fs::remove_job(d.id, &mut self.write_jobs) {
-                                job.modify_time();
-                                err = job.job_error();
+                                #[cfg(target_os = "android")]
+                                let mut job = job;
+                                err = job
+                                    .finish_download()
+                                    .err()
+                                    .map(|err| err.to_string())
+                                    .or_else(|| job.job_error());
+                                #[cfg(target_os = "android")]
+                                if let Err(error) = job.finish_document().await {
+                                    err = Some(error.to_string());
+                                }
                                 job_type = job.r#type;
                                 printer_data = match job.get_buf_data().await {
                                     Ok(d) => d,
@@ -1853,6 +2235,20 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         Some(file_response::Union::Error(e)) => {
+                            #[cfg(target_os = "android")]
+                            if let Some(job) = fs::get_job(e.id, &mut self.write_jobs) {
+                                if let Err(error) = job.cancel_document().await {
+                                    const CLEANUP_ERROR_LOG_INTERVAL: Duration =
+                                        Duration::from_secs(60);
+                                    hbb_common::throttled_log!(
+                                        CLEANUP_ERROR_LOG_INTERVAL,
+                                        warn,
+                                        "Failed to clean up document transfer {}: {}",
+                                        e.id,
+                                        error
+                                    );
+                                }
+                            }
                             let job_type = fs::remove_job(e.id, &mut self.write_jobs)
                                 .or_else(|| fs::remove_job(e.id, &mut self.read_jobs))
                                 .map(|j| j.r#type)
@@ -2196,6 +2592,7 @@ impl<T: InvokeUiSession> Remote<T> {
     }
 
     fn set_peer_info(&mut self, pi: &PeerInfo) {
+        self.last_auto_fps = None;
         self.peer_info.platform = pi.platform.clone();
 
         // Check features field for terminal support
@@ -2404,6 +2801,10 @@ impl<T: InvokeUiSession> Remote<T> {
 
     #[cfg(any(target_os = "windows", feature = "unix-file-copy-paste"))]
     async fn handle_cliprdr_msg(&mut self, clip: base::message_proto::Cliprdr, _peer: &mut Stream) {
+        if !self.is_connected {
+            log::debug!("Discarding incoming file clipboard message before login");
+            return;
+        }
         log::debug!("handling cliprdr msg from server peer");
         #[cfg(feature = "flutter")]
         if let Some(base::message_proto::cliprdr::Union::FormatList(_)) = &clip.union {
@@ -2435,6 +2836,9 @@ impl<T: InvokeUiSession> Remote<T> {
             };
             #[cfg(target_os = "windows")]
             {
+                if matches!(&clip, clipboard::ClipboardFile::FormatList { .. }) {
+                    self.initial_clipboard_pending = false;
+                }
                 let _ = ContextSend::proc(|context| -> ResultType<()> {
                     context
                         .server_clip_file(self.client_conn_id, clip)
@@ -2443,6 +2847,10 @@ impl<T: InvokeUiSession> Remote<T> {
             }
             #[cfg(feature = "unix-file-copy-paste")]
             if crate::is_support_file_copy_paste_num(self.handler.lc.read().unwrap().version) {
+                #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                if matches!(&clip, clipboard::ClipboardFile::FormatList { .. }) {
+                    self.initial_clipboard_pending = false;
+                }
                 let mut out_msgs = vec![];
 
                 #[cfg(target_os = "macos")]
@@ -2547,6 +2955,69 @@ impl<T: InvokeUiSession> Remote<T> {
         msg.set_misc(misc);
         self.sender.send(Data::Message(msg)).ok();
     }
+
+    /// A shape that decoded, for the UI to ask for again; see `Session::cursor_shapes`.
+    #[cfg(feature = "flutter")]
+    fn keep_cursor_shape(&self, shape: CursorData) {
+        self.handler
+            .cursor_shapes
+            .write()
+            .unwrap()
+            .insert(shape.id, shape);
+    }
+
+    fn dedupes_cursors(&self) -> bool {
+        !crate::is_peer_naming_cursors_by_content(self.handler.lc.read().unwrap().version)
+    }
+
+    /// A shape the UI already has, under whatever handle, is only selected.
+    fn set_cursor_data_by_content(&mut self, cd: CursorData) {
+        let peer_id = cd.id;
+        let id = CursorDedupe::name(&cd);
+        if self.cursor_dedupe.has_decoded(id) {
+            self.cursor_dedupe.record(peer_id, id);
+            self.handler.set_cursor_id(id.to_string());
+            return;
+        }
+        #[cfg(feature = "flutter")]
+        let compressed = cd.colors.clone();
+        match decode_cursor_data(cd) {
+            Ok(mut cd) => {
+                cd.id = id;
+                self.cursor_dedupe.record(peer_id, id);
+                #[cfg(feature = "flutter")]
+                self.keep_cursor_shape(cursor_shape(id, &cd, &compressed));
+                self.handler.set_cursor_data(cd);
+            }
+            Err(err) => {
+                log::warn!("Rejected cursor {peer_id}: {err}");
+                self.handler
+                    .set_cursor_id(self.cursor_dedupe.rejected(peer_id, id).to_string());
+            }
+        }
+    }
+}
+
+/// A shape that decoded, still compressed, under the id the UI knows it by. Copied once it
+/// decoded: the message's colors may be a slice of a larger received buffer, which a clone
+/// would keep alive.
+#[cfg(feature = "flutter")]
+fn cursor_shape(id: u64, cd: &CursorData, compressed: &[u8]) -> CursorData {
+    CursorData {
+        id,
+        hotx: cd.hotx,
+        hoty: cd.hoty,
+        width: cd.width,
+        height: cd.height,
+        colors: compressed.to_vec().into(),
+        ..Default::default()
+    }
+}
+
+/// The RGBA of a shape kept by `Session::cursor_shapes`, for the UI to draw it again.
+#[cfg(any(feature = "flutter", test))]
+pub(crate) fn kept_cursor_rgba(shape: CursorData) -> hbb_common::ResultType<CursorData> {
+    decode_cursor_data(shape)
 }
 
 // Both UI handlers receive validated, uncompressed RGBA from the receive loop.
@@ -2588,6 +3059,49 @@ fn decode_cursor_data(data: CursorData) -> hbb_common::ResultType<CursorData> {
     }
     cd.colors = colors.into();
     Ok(cd)
+}
+
+/// Gives the UI one id per shape for a peer that names shapes by handle, so the UI decodes and
+/// keeps a shape once however many handles it arrives under. Nothing is dropped for the
+/// connection: the peer sends a shape once and may select any handle it named again.
+#[derive(Default)]
+struct CursorDedupe {
+    ids: HashMap<u64, u64>,
+    // The shapes given to the UI, by content id: whether one that arrives needs decoding.
+    decoded: HashSet<u64>,
+}
+
+impl CursorDedupe {
+    /// Hashes the compressed colors: one peer compresses the same pixels to the same bytes, and
+    /// a shape seen before is then never decompressed again.
+    fn name(cd: &CursorData) -> u64 {
+        crate::cursor_content_id(cd.width, cd.height, cd.hotx, cd.hoty, &cd.colors)
+    }
+
+    fn id(&self, peer_id: u64) -> u64 {
+        self.ids.get(&peer_id).copied().unwrap_or(peer_id)
+    }
+
+    fn has_decoded(&self, id: u64) -> bool {
+        self.decoded.contains(&id)
+    }
+
+    /// Names the handle once its shape decoded, now or before.
+    fn record(&mut self, peer_id: u64, id: u64) {
+        self.ids.insert(peer_id, id);
+        self.decoded.insert(id);
+    }
+
+    /// Names a known handle by the content of a shape that did not decode, which is never
+    /// marked decoded: the UI has no shape under it, now or when the handle is selected again,
+    /// and the shape the handle named before is not shown in its place. A handle never seen is
+    /// not filed, so what a peer sends that does not decode takes no room.
+    fn rejected(&mut self, peer_id: u64, id: u64) -> u64 {
+        if let Some(named) = self.ids.get_mut(&peer_id) {
+            *named = id;
+        }
+        id
+    }
 }
 
 struct RemoveJob {
@@ -2641,5 +3155,171 @@ impl Drop for VideoThread {
     fn drop(&mut self) {
         // since channels are buffered, messages sent before the disconnect will still be properly received.
         *self.discard_queue.write().unwrap() = true;
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "flutter")]
+mod tests {
+    use super::*;
+    use crate::flutter::FlutterHandler;
+
+    /// A round's `Remote` over a loopback pair, before any login: what it sends to `peer`
+    /// arrives at `far`.
+    async fn remote_and_peer() -> (Remote<FlutterHandler>, Stream, Stream) {
+        let listener = hbb_common::tcp::new_listener("127.0.0.1:0", false)
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (peer, accepted) = tokio::join!(
+            hbb_common::socket_client::connect_tcp(addr.to_string(), 3000),
+            listener.accept()
+        );
+        let (accepted, far_addr) = accepted.unwrap();
+        let far = Stream::Tcp(hbb_common::tcp::FramedStream::from(accepted, far_addr));
+        let (sender, receiver) = mpsc::unbounded_channel::<Data>();
+        let remote = Remote::new(Session::<FlutterHandler>::default(), receiver, sender);
+        (remote, peer.unwrap(), far)
+    }
+
+    async fn arrives(far: &mut Stream) -> bool {
+        matches!(hbb_common::timeout(300, far.next()).await, Ok(Some(Ok(_))))
+    }
+
+    fn clipboard() -> Data {
+        let mut msg = Message::new();
+        msg.set_clipboard(Clipboard {
+            content: b"copied while this login was pending".to_vec().into(),
+            ..Default::default()
+        });
+        Data::Message(msg)
+    }
+
+    fn auth_2fa() -> Data {
+        let mut msg = Message::new();
+        msg.set_auth_2fa(Auth2FA {
+            code: "123456".to_owned(),
+            ..Default::default()
+        });
+        Data::Message(msg)
+    }
+
+    // A clipboard queued before this round's login stays here; what the login itself sends
+    // through the same queue does not.
+    #[tokio::test]
+    async fn a_clipboard_queued_before_this_rounds_login_is_dropped() {
+        let (mut remote, mut peer, mut far) = remote_and_peer().await;
+        assert!(!remote.is_connected);
+        assert!(remote.handle_msg_from_ui(clipboard(), &mut peer).await);
+        assert!(
+            !arrives(&mut far).await,
+            "a clipboard went out before the login"
+        );
+        assert!(remote.handle_msg_from_ui(auth_2fa(), &mut peer).await);
+        assert!(arrives(&mut far).await, "the 2FA code was held back");
+
+        remote.is_connected = true;
+        assert!(remote.handle_msg_from_ui(clipboard(), &mut peer).await);
+        assert!(
+            arrives(&mut far).await,
+            "a clipboard after the login was held back"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_fps_update_allows_the_same_automatic_limit_again() {
+        let (mut remote, mut peer, mut far) = remote_and_peer().await;
+        let (video_sender, _video_receiver) = std::sync::mpsc::channel();
+        remote.video_threads.insert(
+            0,
+            VideoThread {
+                video_queue: Arc::new(RwLock::new(ArrayQueue::new(client::VIDEO_QUEUE_SIZE))),
+                video_sender,
+                decode_fps: Arc::new(RwLock::new(Some(23))),
+                frame_count: Default::default(),
+                discard_queue: Default::default(),
+                fps_control: Default::default(),
+            },
+        );
+
+        for (manual_fps, expected) in [(None, 20), (Some(90), 90), (None, 20)] {
+            if let Some(fps) = manual_fps {
+                let lc = &remote.handler.lc;
+                let msg = lc.write().unwrap().set_custom_fps(fps, false);
+                remote
+                    .handle_msg_from_ui(Data::Message(msg), &mut peer)
+                    .await;
+            } else {
+                remote
+                    .fps_control(true, HashMap::from([(0, 20)]), &mut peer)
+                    .await;
+            }
+            let bytes = timeout(1000, far.next())
+                .await
+                .expect("FPS update was not sent")
+                .unwrap()
+                .unwrap();
+            let msg = Message::parse_from_bytes(&bytes).unwrap();
+            assert_eq!(msg.misc().option().custom_fps, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cursor_dedupe_tests {
+    use super::*;
+
+    fn shape(id: u64, hotx: i32, colors: &[u8]) -> CursorData {
+        CursorData {
+            id,
+            hotx,
+            width: 2,
+            height: 2,
+            colors: colors.to_vec().into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_shape_sent_under_a_new_handle_keeps_its_id() {
+        let mut dedupe = CursorDedupe::default();
+        let first = CursorDedupe::name(&shape(1, 0, b"arrow"));
+        assert!(!dedupe.has_decoded(first));
+        dedupe.record(1, first);
+
+        let again = CursorDedupe::name(&shape(2, 0, b"arrow"));
+        assert_eq!(again, first);
+        assert!(dedupe.has_decoded(again));
+        dedupe.record(2, again);
+        assert_eq!(dedupe.id(2), first);
+        assert_eq!(dedupe.id(1), first);
+    }
+}
+
+#[cfg(test)]
+mod kept_cursor_tests {
+    use super::*;
+
+    fn compressed(width: i32, height: i32) -> CursorData {
+        let rgba = vec![7u8; (width * height * 4) as usize];
+        CursorData {
+            id: 1,
+            width,
+            height,
+            colors: hbb_common::compress::compress(&rgba).into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_kept_shape_is_checked_again_when_it_is_read() {
+        assert_eq!(kept_cursor_rgba(compressed(4, 4)).unwrap().colors.len(), 64);
+        assert!(
+            kept_cursor_rgba(compressed(513, 1)).is_err(),
+            "over the size cap"
+        );
+        let mut bomb = compressed(4, 4);
+        bomb.colors = hbb_common::compress::compress(&vec![0u8; 1 << 20]).into();
+        assert!(kept_cursor_rgba(bomb).is_err(), "more pixels than its size");
     }
 }

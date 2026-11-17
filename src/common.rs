@@ -37,7 +37,7 @@ use hbb_common::{
 
 use crate::{
     hbbs_http::{create_http_client_async, get_url_for_tls},
-    ui_interface::{get_api_server as ui_get_api_server, get_option, is_installed, set_option},
+    ui_interface::{get_api_server as ui_get_api_server, get_option, set_option},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -59,6 +59,7 @@ pub const PLATFORM_MACOS: &str = "Mac OS";
 pub const PLATFORM_ANDROID: &str = "Android";
 
 pub const TIMER_OUT: Duration = Duration::from_secs(1);
+pub(crate) const API_LOG_INTERVAL: Duration = Duration::from_secs(600);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
@@ -148,6 +149,24 @@ pub fn is_support_multi_ui_session_num(ver: i64) -> bool {
     ver >= hbb_common::get_version_number(MIN_VER_MULTI_UI_SESSION)
 }
 
+/// Peers from the 1.5.0 release name a cursor by `cursor_content_id`; older ones by the
+/// platform handle, which apps mint anew for the same shape.
+#[inline]
+pub fn is_peer_naming_cursors_by_content(ver: i64) -> bool {
+    ver >= hbb_common::get_version_number("1.5.0")
+}
+
+/// One id per cursor look, however many handles a platform gives it. Held to 53 bits: the web
+/// client decodes a u64 into a JS number and drops the whole message when it does not fit.
+pub fn cursor_content_id(width: i32, height: i32, hotx: i32, hoty: i32, colors: &[u8]) -> u64 {
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    for v in [width, height, hotx, hoty] {
+        hasher.update(&v.to_le_bytes());
+    }
+    hasher.update(colors);
+    hasher.digest() & ((1 << 53) - 1)
+}
+
 #[inline]
 #[cfg(feature = "unix-file-copy-paste")]
 pub fn is_support_file_copy_paste(ver: &str) -> bool {
@@ -220,8 +239,7 @@ pub fn need_fs_cm_send_files() -> bool {
     }
 }
 
-/// Android is scoped-storage only: the peer may never touch anything outside the app
-/// workspace (`Config::get_home()`, i.e. the app-specific external files directory).
+/// Android peers may access only the current shared file-transfer location.
 ///
 /// Every peer supplied path must be validated with this before it reaches the
 /// filesystem, for reads, writes, renames, creations and deletions alike. The path is
@@ -233,6 +251,22 @@ pub fn need_fs_cm_send_files() -> bool {
 #[cfg(target_os = "android")]
 pub fn is_peer_path_allowed(path: &str, allow_empty: bool) -> bool {
     use std::path::{Component, Path, PathBuf};
+
+    if base::fs::android::is_path(Path::new(path)) {
+        return match base::fs::android::allowed(path) {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+                hbb_common::throttled_log!(
+                    ERROR_LOG_INTERVAL,
+                    warn,
+                    "Document access denied: {}",
+                    error
+                );
+                false
+            }
+        };
+    }
 
     // Canonicalize the deepest existing ancestor and re-append the missing tail.
     fn resolve(path: &Path) -> Option<PathBuf> {
@@ -260,7 +294,7 @@ pub fn is_peer_path_allowed(path: &str, allow_empty: bool) -> bool {
     if !path.is_absolute() || path.components().any(|c| c == Component::ParentDir) {
         return false;
     }
-    let home = Config::get_home();
+    let home = base::fs::get_path(&base::fs::get_home_as_string());
     let home = home.canonicalize().unwrap_or(home);
     if home.as_os_str().is_empty() {
         return false;
@@ -273,6 +307,24 @@ pub fn is_peer_path_allowed(path: &str, allow_empty: bool) -> bool {
 #[cfg(not(target_os = "android"))]
 pub fn is_peer_path_allowed(_path: &str, _allow_empty: bool) -> bool {
     true
+}
+
+#[cfg(target_os = "android")]
+pub async fn is_peer_path_allowed_async(path: &str, allow_empty: bool) -> bool {
+    let path = path.to_owned();
+    match tokio::task::spawn_blocking(move || is_peer_path_allowed(&path, allow_empty)).await {
+        Ok(allowed) => allowed,
+        Err(error) => {
+            const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+            hbb_common::throttled_log!(
+                ERROR_LOG_INTERVAL,
+                error,
+                "File-transfer access check failed: {}",
+                error
+            );
+            false
+        }
+    }
 }
 
 #[inline]
@@ -718,13 +770,6 @@ async fn test_nat_type_() -> ResultType<bool> {
                 } else {
                     port2 = tnr.port;
                 }
-                if let Some(cu) = tnr.cu.as_ref() {
-                    Config::set_option(
-                        "rendezvous-servers".to_owned(),
-                        cu.rendezvous_servers.join(","),
-                    );
-                    Config::set_serial(cu.serial);
-                }
             }
         } else {
             break;
@@ -925,7 +970,7 @@ pub fn get_sysinfo() -> serde_json::Value {
     let cpu_name = cpus.first().map(|x| x.brand()).unwrap_or_default();
     let cpu_name = cpu_name.trim_end();
     let cpu_freq = cpus.first().map(|x| x.frequency()).unwrap_or_default();
-    let cpu_freq = (cpu_freq as f64 / 1024. * 100.).round() / 100.;
+    let cpu_freq = (cpu_freq as f64 / 1000. * 100.).round() / 100.;
     let cpu = if cpu_freq > 0. {
         format!("{}, {}GHz, ", cpu_name, cpu_freq)
     } else {
@@ -970,6 +1015,20 @@ pub fn increase_port<T: std::string::ToString>(host: T, offset: i32) -> String {
     hbb_common::socket_client::increase_port(host, offset)
 }
 
+/// A relay uuid arrives from the network and is sent on to the relay address, so bound what it
+/// may carry; it is an opaque pairing key, so do not pin today's UUID format.
+pub fn check_relay_uuid(uuid: &str) -> ResultType<()> {
+    if uuid.is_empty()
+        || uuid.len() > 128
+        || !uuid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid relay uuid (length {})", uuid.len());
+    }
+    Ok(())
+}
+
 pub const POSTFIX_SERVICE: &'static str = "_service";
 
 #[inline]
@@ -1008,39 +1067,94 @@ pub fn check_software_update() {
     }
 }
 
-// No need to check `danger_accept_invalid_cert` for now.
-// Because the url is always `https://api.rustdesk.com/version/latest`.
-#[tokio::main(flavor = "current_thread")]
-pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
-    let (request, url) =
-        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(&url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_not_cached = tls_type.is_none();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, false);
-    let latest_release_response = match client.post(&url).json(&request).send().await {
-        Ok(resp) => {
-            upsert_tls_cache(tls_url, tls_type, false);
-            resp
-        }
-        Err(err) => {
-            if is_tls_not_cached && err.is_request() {
-                let tls_type = TlsType::NativeTls;
-                let client = create_http_client_async(tls_type, false);
-                let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
-                resp
-            } else {
-                return Err(err.into());
-            }
-        }
+pub(crate) fn release_id_from_update_url(update_url: &str) -> ResultType<String> {
+    let url = url::Url::parse(update_url)?;
+    if url.scheme() != "https" || url.host_str() != Some("github.com") {
+        bail!(
+            "Update URL is not a GitHub HTTPS release URL: {}",
+            update_url
+        );
+    }
+    if url_has_explicit_port(update_url)
+        || url.port().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        bail!(
+            "Update URL must not contain credentials or an explicit port: {}",
+            update_url
+        );
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        bail!(
+            "Update URL must not contain query or fragment: {}",
+            update_url
+        );
+    }
+
+    let Some(segments) = url.path_segments() else {
+        bail!("Update URL has no path: {}", update_url);
     };
-    let bytes = latest_release_response.bytes().await?;
+    let segments = segments.collect::<Vec<_>>();
+    let release_id = match segments.as_slice() {
+        ["rustdesk", "rustdesk", "releases", "tag", release_id] => *release_id,
+        ["rustdesk", "rustdesk", "releases", "tag", release_id, ""] => *release_id,
+        _ => bail!(
+            "Update URL is not a RustDesk release tag URL: {}",
+            update_url
+        ),
+    };
+    if release_id.is_empty()
+        || release_id == "."
+        || release_id == ".."
+        || release_id.contains([' ', '/', '\\', '?', '#'])
+        || release_id.contains('%')
+    {
+        bail!("Update URL has no release id: {}", update_url);
+    }
+    Ok(release_id.to_owned())
+}
+
+pub(crate) fn url_has_explicit_port(raw_url: &str) -> bool {
+    let Some((_, rest)) = raw_url.split_once("://") else {
+        return false;
+    };
+    let authority = rest
+        .split(|c| matches!(c, '/' | '?' | '#'))
+        .next()
+        .unwrap_or_default();
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    host_port.rsplit_once(':').is_some()
+}
+
+pub(crate) fn display_version_from_release_id(release_id: &str) -> ResultType<String> {
+    let display_version = release_id.strip_prefix('v').unwrap_or(release_id);
+    let segments = display_version.split('.').collect::<Vec<_>>();
+    if segments.len() != 3
+        || segments.iter().any(|segment| {
+            segment.is_empty()
+                || !segment.chars().all(|c| c.is_ascii_digit())
+                || segment.parse::<u16>().is_err()
+        })
+    {
+        bail!("Release id is not a stable display version: {}", release_id);
+    }
+    if get_version_number(display_version) <= 0 {
+        bail!("Release id has invalid display version: {}", release_id);
+    }
+    Ok(display_version.to_owned())
+}
+
+fn clear_software_update_url() {
+    let mut update_url = SOFTWARE_UPDATE_URL.lock().unwrap();
+    *update_url = String::new();
+}
+
+fn process_software_update_check_response(bytes: Bytes) -> ResultType<()> {
     let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
     let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
+    let release_id = release_id_from_update_url(&response_url)?;
+    let latest_release_version = display_version_from_release_id(&release_id)?;
 
     if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
         #[cfg(feature = "flutter")]
@@ -1054,9 +1168,58 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
         }
         *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
     } else {
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
+        clear_software_update_url();
     }
     Ok(())
+}
+
+// No need to check `danger_accept_invalid_cert` for now.
+// Because the url is always `https://api.rustdesk.com/version/latest`.
+#[tokio::main(flavor = "current_thread")]
+pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
+    let (request, url) =
+        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(&url, &proxy_conf);
+    let tls_type = get_cached_tls_type(tls_url);
+    let is_tls_not_cached = tls_type.is_none();
+    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
+    let client = create_http_client_async(tls_type, false);
+    let latest_release_response: ResultType<_> = match client.post(&url).json(&request).send().await
+    {
+        Ok(resp) => Ok((tls_type, resp)),
+        Err(err) => {
+            if is_tls_not_cached && err.is_request() {
+                let tls_type = TlsType::NativeTls;
+                let client = create_http_client_async(tls_type, false);
+                match client.post(&url).json(&request).send().await {
+                    Ok(resp) => Ok((tls_type, resp)),
+                    Err(err) => Err(err.into()),
+                }
+            } else {
+                Err(err.into())
+            }
+        }
+    };
+    let response_bytes = match latest_release_response {
+        Ok((used_tls_type, response)) => {
+            upsert_tls_cache(tls_url, used_tls_type, false);
+            let status = response.status();
+            if !status.is_success() {
+                Err(anyhow!(
+                    "Software update check failed with HTTP status: {status}"
+                ))
+            } else {
+                response.bytes().await.map_err(|err| err.into())
+            }
+        }
+        Err(err) => Err(err),
+    };
+    let result = response_bytes.and_then(process_software_update_check_response);
+    if result.is_err() {
+        clear_software_update_url();
+    }
+    result
 }
 
 #[inline]
@@ -1135,6 +1298,11 @@ fn get_api_server_(api: String, custom: String) -> String {
     if !s0.is_empty() {
         let s = crate::increase_port(&s0, -2);
         if s == s0 {
+            let s = if hbb_common::is_ipv6_str(&s) && !s.starts_with('[') {
+                format!("[{s}]")
+            } else {
+                s
+            };
             return format!("http://{}:{}", s, config::RENDEZVOUS_PORT - 2);
         } else {
             return format!("http://{}", s);
@@ -1196,6 +1364,9 @@ pub fn get_local_option(key: &str) -> String {
             }
         }
     }
+    if key == "lang" && (v == "pt" || v == "br") {
+        return "pt-br".to_owned();
+    }
     v
 }
 
@@ -1242,6 +1413,23 @@ fn should_use_tcp_proxy_for_api_url(url: &str, api_url: &str) -> bool {
 #[inline]
 fn is_tcp_proxy_api_target(url: &str) -> bool {
     should_use_tcp_proxy_for_api_url(url, &ui_get_api_server())
+}
+
+#[inline]
+fn should_throttle_log(url: &str) -> bool {
+    url::Url::parse(url)
+        .map(|parsed| parsed.path().ends_with("/api/heartbeat"))
+        .unwrap_or(false)
+}
+
+macro_rules! api_log {
+    ($level:ident, $url:expr, $interval:expr, $($arg:tt)+) => {{
+        if should_throttle_log($url) {
+            hbb_common::throttled_log!($interval, $level, $($arg)+);
+        } else {
+            log::$level!($($arg)+);
+        }
+    }};
 }
 
 fn tcp_proxy_log_target(url: &str) -> String {
@@ -1293,7 +1481,10 @@ async fn tcp_proxy_request(
         parsed.path().to_string()
     };
 
-    log::debug!(
+    api_log!(
+        debug,
+        url,
+        API_LOG_INTERVAL,
         "Sending {} {} via TCP proxy to {}",
         method,
         parsed.path(),
@@ -1453,7 +1644,10 @@ where
     };
 
     if should_fallback && can_fallback_to_raw_tcp(url) {
-        log::warn!(
+        api_log!(
+            warn,
+            url,
+            API_LOG_INTERVAL,
             "HTTP {} to {} failed or 5xx (result: {:?}), trying TCP proxy fallback",
             method,
             tcp_proxy_log_target(url),
@@ -1465,7 +1659,13 @@ where
         match tcp_fn.await {
             Ok(resp) => return Ok(resp),
             Err(tcp_err) => {
-                log::warn!("TCP proxy fallback also failed: {:?}", tcp_err);
+                api_log!(
+                    warn,
+                    url,
+                    API_LOG_INTERVAL,
+                    "TCP proxy fallback also failed: {:?}",
+                    tcp_err
+                );
             }
         }
     }
@@ -1523,7 +1723,10 @@ pub async fn post_request_with_status(
         Ok((status, _)) => *status >= 500,
     };
     if should_fallback && can_fallback_to_raw_tcp(&url) {
-        log::warn!(
+        api_log!(
+            warn,
+            &url,
+            API_LOG_INTERVAL,
             "HTTP POST to {} failed or 5xx (result: {:?}), trying TCP proxy fallback",
             tcp_proxy_log_target(&url),
             http_result
@@ -1534,7 +1737,13 @@ pub async fn post_request_with_status(
         match post_request_via_tcp_proxy_status(&url, &body, header).await {
             Ok(resp) => return Ok(resp),
             Err(tcp_err) => {
-                log::warn!("TCP proxy fallback also failed: {:?}", tcp_err);
+                api_log!(
+                    warn,
+                    &url,
+                    API_LOG_INTERVAL,
+                    "TCP proxy fallback also failed: {:?}",
+                    tcp_err
+                );
             }
         }
     }
@@ -1591,7 +1800,10 @@ async fn post_request_(
             Err(e) => {
                 if (tls_type.is_none() || danger_accept_invalid_cert.is_none()) && e.is_request() {
                     if danger_accept_invalid_cert.is_none() {
-                        log::warn!(
+                        api_log!(
+                            warn,
+                            url,
+                            API_LOG_INTERVAL,
                             "HTTP request failed: {:?}, try again, danger accept invalid cert",
                             e
                         );
@@ -1606,7 +1818,13 @@ async fn post_request_(
                         )
                         .await
                     } else {
-                        log::warn!("HTTP request failed: {:?}, try again with native-tls", e);
+                        api_log!(
+                            warn,
+                            url,
+                            API_LOG_INTERVAL,
+                            "HTTP request failed: {:?}, try again with native-tls",
+                            e
+                        );
                         post_request_(
                             url,
                             tls_url,
@@ -2100,17 +2318,46 @@ async fn key_exchange(conn: &mut Stream, key: &str, log_on_success: bool) -> Res
                         }
                         let their_pk_b = sign::verify(&ex.keys[0], &rs_pk)
                             .map_err(|_| anyhow!("Signature mismatch in key exchange"))?;
-                        let (asymmetric_value, symmetric_value, key) = create_symmetric_key_msg(
-                            get_pk(&their_pk_b)
-                                .context("Wrong their public length in key exchange")?,
-                        );
+                        let their_pk_b = get_pk(&their_pk_b)
+                            .context("Wrong their public length in key exchange")?;
+                        // The signed X25519 high bit marks servers that sign their parameters.
+                        // X25519 ignores that bit, so old clients use the key unchanged; keep
+                        // the bytes as signed, since the transcript and KxParams carry them so.
+                        if their_pk_b[31] & 0x80 != 0 || !ex.signed_params.is_empty() {
+                            let params = sign::verify(&ex.signed_params, &rs_pk)
+                                .ok()
+                                .and_then(|signed| {
+                                    let params =
+                                        signed.strip_prefix(hbb_common::tcp::KX_PARAMS_DOMAIN)?;
+                                    KxParams::parse_from_bytes(params).ok()
+                                })
+                                .ok_or_else(|| {
+                                    anyhow!("Missing or invalid signed key exchange parameters")
+                                })?;
+                            if params.pk[..] != their_pk_b[..] || params.version != ex.version {
+                                bail!("Key exchange version or public key does not match its signature");
+                            }
+                        }
+                        let (asymmetric_value, symmetric_value, key) =
+                            create_symmetric_key_msg(their_pk_b);
+                        let picked = hbb_common::tcp::kx_version_for(ex.version);
                         let mut msg_out = RendezvousMessage::new();
                         msg_out.set_key_exchange(KeyExchange {
-                            keys: vec![asymmetric_value, symmetric_value],
+                            keys: vec![asymmetric_value.clone(), symmetric_value],
+                            version: picked,
                             ..Default::default()
                         });
                         timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
-                        conn.set_key(key);
+                        conn.set_negotiated_key(
+                            key,
+                            true,
+                            &hbb_common::tcp::KxTranscript {
+                                initiator_pk: &asymmetric_value,
+                                responder_pk: &their_pk_b,
+                                advertised: ex.version,
+                                picked,
+                            },
+                        )?;
                         if log_on_success {
                             log::info!("Connection secured");
                         }
@@ -2170,21 +2417,23 @@ pub fn get_rs_pk(str_base64: &str) -> Option<sign::PublicKey> {
 }
 
 pub fn decode_id_pk(signed: &[u8], key: &sign::PublicKey) -> ResultType<(String, [u8; 32])> {
-    let (id, pk, _) = decode_id_pk_dtls(signed, key)?;
+    let (id, pk, _, _) = decode_id_pk_dtls(signed, key)?;
     Ok((id, pk))
 }
 
 /// Like [`decode_id_pk`] but also returns the signed DTLS certificate fingerprint (empty string
-/// for non-WebRTC peers), used to bind a WebRTC DTLS channel to the verified peer identity.
+/// for non-WebRTC peers), used to bind a WebRTC DTLS channel to the verified peer identity, and
+/// the newest key exchange version the peer speaks (0, the original scheme, for a peer from
+/// before versions).
 pub fn decode_id_pk_dtls(
     signed: &[u8],
     key: &sign::PublicKey,
-) -> ResultType<(String, [u8; 32], String)> {
+) -> ResultType<(String, [u8; 32], String, u32)> {
     let res = IdPk::parse_from_bytes(
         &sign::verify(signed, key).map_err(|_| anyhow!("Signature mismatch"))?,
     )?;
     if let Some(pk) = get_pk(&res.pk) {
-        Ok((res.id, pk, res.dtls_fingerprint))
+        Ok((res.id, pk, res.dtls_fingerprint, res.kx_version))
     } else {
         bail!("Wrong their public length");
     }
@@ -2852,16 +3101,67 @@ mod tests {
         self,
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
-    use std::collections::HashSet;
 
-    #[inline]
-    fn get_timestamp_secs() -> u128 {
-        (std::time::SystemTime::UNIX_EPOCH
-            .elapsed()
-            .unwrap()
-            .as_millis()
-            + 500)
-            / 1000
+    #[test]
+    fn relay_uuid_rejects_control_bytes_but_not_other_id_formats() {
+        for uuid in [
+            "e4c181d0-41c7-4ae6-8ef0-36581b6b2b12",
+            "E4C181D0-41C7-4AE6-8EF0-36581B6B2B12",
+            "01890a5d-ac96-774b-bcce-b302099a8057",
+            "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ] {
+            assert!(check_relay_uuid(uuid).is_ok(), "rejected {uuid:?}");
+        }
+        let too_long = "a".repeat(129);
+        for uuid in ["", "\r\nPING\r\n", "a b", "a\0", too_long.as_str()] {
+            assert!(check_relay_uuid(uuid).is_err(), "accepted {uuid:?}");
+        }
+    }
+
+    #[test]
+    fn parses_stable_rustdesk_release_url() {
+        let update_url = "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6";
+
+        assert_eq!(release_id_from_update_url(update_url).unwrap(), "v1.4.6");
+        assert_eq!(display_version_from_release_id("v1.4.6").unwrap(), "1.4.6");
+        assert_eq!(
+            release_id_from_update_url(&format!("{update_url}/")).unwrap(),
+            "v1.4.6"
+        );
+    }
+
+    #[test]
+    fn rejects_untrusted_release_urls_and_unstable_versions() {
+        for update_url in [
+            "http://github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://github.com:8443/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://github.com:443/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://user@github.com/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://example.com/rustdesk/rustdesk/releases/tag/v1.4.6",
+            "https://github.com/other/rustdesk/releases/tag/v1.4.6",
+            "https://github.com/rustdesk/other/releases/tag/v1.4.6",
+            "https://github.com/rustdesk/rustdesk/releases/download/v1.4.6/rustdesk.exe",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6?x=1",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6#asset",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1.4.6/extra",
+            "https://github.com/rustdesk/rustdesk/releases/tag/v1%2F4%2F6",
+            "https://github.com/rustdesk/rustdesk/releases/tag/%2e%2e",
+        ] {
+            assert!(release_id_from_update_url(update_url).is_err());
+        }
+        for release_id in ["v1.4.6-rc1", "nightly", "v9223372036854775807.1.1"] {
+            assert!(display_version_from_release_id(release_id).is_err());
+        }
+    }
+
+    #[test]
+    fn a_cursor_content_id_fits_a_web_client_number() {
+        const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+        for colors in [&b"arrow"[..], b"beam", b"hand", b""] {
+            for hotx in 0..64 {
+                assert!(cursor_content_id(32, 32, hotx, 0, colors) <= MAX_SAFE_INTEGER);
+            }
+        }
     }
 
     fn interval_maker() -> Interval {
@@ -2930,58 +3230,10 @@ mod tests {
         }
     }
 
-    // ThrottledInterval tick at the same time as tokio interval, if no sleeps
+    // ThrottledInterval tick less times than tokio interval, if there're sleeps.
+    // The clock is paused, so a stalled runner cannot make two ticks look close together.
     #[allow(non_snake_case)]
-    #[tokio::test]
-    async fn test_RustDesk_interval() {
-        let base_intervals = [interval_maker, interval_at_maker];
-        for maker in base_intervals.into_iter() {
-            let mut tokio_timer = maker();
-            let mut tokio_times = Vec::new();
-            let mut timer = rustdesk_interval(maker());
-            let mut times = Vec::new();
-            loop {
-                tokio::select! {
-                    _ = timer.tick() => {
-                        if tokio_times.len() >= 10 && times.len() >= 10 {
-                            break;
-                        }
-                        times.push(get_timestamp_secs());
-                    }
-                    _ = tokio_timer.tick() => {
-                        if tokio_times.len() >= 10 && times.len() >= 10 {
-                            break;
-                        }
-                        tokio_times.push(get_timestamp_secs());
-                    }
-                }
-            }
-            assert_eq!(times, tokio_times);
-        }
-    }
-
-    #[tokio::test]
-    async fn test_tokio_time_interval_sleep() {
-        let mut timer = interval_maker();
-        let mut times = Vec::new();
-        sleep(Duration::from_secs(3)).await;
-        loop {
-            tokio::select! {
-                _ = timer.tick() => {
-                    times.push(get_timestamp_secs());
-                    if times.len() == 5 {
-                        break;
-                    }
-                }
-            }
-        }
-        let times2: HashSet<u128> = HashSet::from_iter(times.clone());
-        assert_eq!(times.len(), times2.len() + 3);
-    }
-
-    // ThrottledInterval tick less times than tokio interval, if there're sleeps
-    #[allow(non_snake_case)]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_RustDesk_interval_sleep() {
         let base_intervals = [interval_maker, interval_at_maker];
         for (i, maker) in base_intervals.into_iter().enumerate() {
@@ -2991,79 +3243,25 @@ mod tests {
             loop {
                 tokio::select! {
                     _ = timer.tick() => {
-                        times.push(get_timestamp_secs());
+                        times.push(Instant::now());
                         if times.len() == 5 {
                             break;
                         }
                     }
                 }
             }
-            // No multiple ticks in the `interval` time.
-            // Values in "times" are unique and are less than normal tokio interval.
-            // See previous test (test_tokio_time_interval_sleep) for comparison.
-            let times2: HashSet<u128> = HashSet::from_iter(times.clone());
-            assert_eq!(times.len(), times2.len(), "test: {}", i);
+            // No multiple ticks in the `interval` time: tokio's interval bursts the missed ticks
+            // with no gap, ThrottledInterval keeps them at least 0.9 * period apart.
+            for pair in times.windows(2) {
+                let gap = pair[1] - pair[0];
+                assert!(
+                    gap >= Duration::from_millis(900),
+                    "test: {}, gap: {:?}",
+                    i,
+                    gap
+                );
+            }
         }
-    }
-
-    #[test]
-    fn test_duration_multiplication() {
-        let dur = Duration::from_secs(1);
-
-        assert_eq!(dur * 2, Duration::from_secs(2));
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.9),
-            Duration::from_millis(900)
-        );
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.923),
-            Duration::from_millis(923)
-        );
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.923 * 1e-3),
-            Duration::from_micros(923)
-        );
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.923 * 1e-6),
-            Duration::from_nanos(923)
-        );
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.923 * 1e-9),
-            Duration::from_nanos(1)
-        );
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.5 * 1e-9),
-            Duration::from_nanos(1)
-        );
-        assert_eq!(
-            Duration::from_secs_f64(dur.as_secs_f64() * 0.499 * 1e-9),
-            Duration::from_nanos(0)
-        );
-    }
-
-    #[test]
-    fn test_is_public() {
-        // Test URLs containing "rustdesk.com/"
-        assert!(is_public("https://rustdesk.com/"));
-        assert!(is_public("https://www.rustdesk.com/"));
-        assert!(is_public("https://api.rustdesk.com/v1"));
-        assert!(is_public("https://API.RUSTDESK.COM/v1"));
-        assert!(is_public("https://rustdesk.com/path"));
-
-        // Test URLs ending with "rustdesk.com"
-        assert!(is_public("rustdesk.com"));
-        assert!(is_public("https://rustdesk.com"));
-        assert!(is_public("https://RustDesk.com"));
-        assert!(is_public("http://www.rustdesk.com"));
-        assert!(is_public("https://api.rustdesk.com"));
-
-        // Test non-public URLs
-        assert!(!is_public("https://example.com"));
-        assert!(!is_public("https://custom-server.com"));
-        assert!(!is_public("http://192.168.1.1"));
-        assert!(!is_public("localhost"));
-        assert!(!is_public("https://rustdesk.computer.com"));
-        assert!(!is_public("rustdesk.comhello.com"));
     }
 
     #[test]
@@ -3074,6 +3272,14 @@ mod tests {
         assert!(!is_public("hello-rustdesk.com"));
         assert!(!is_public("api.rustdesk.com.evil.test"));
         assert!(!is_public("https://rustdesk.com@evil.test"));
+    }
+
+    #[test]
+    fn test_api_server_from_bare_ipv6_rendezvous_server() {
+        assert_eq!(
+            get_api_server_("".to_owned(), "2001:db8::1".to_owned()),
+            "http://[2001:db8::1]:21114"
+        );
     }
 
     #[test]
@@ -3105,97 +3311,6 @@ mod tests {
     }
 
     #[test]
-    fn test_get_tcp_proxy_addr_normalizes_bare_ipv6_host() {
-        struct RestoreCustomRendezvousServer(String);
-
-        impl Drop for RestoreCustomRendezvousServer {
-            fn drop(&mut self) {
-                Config::set_option(
-                    keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
-                    self.0.clone(),
-                );
-            }
-        }
-
-        let _restore = RestoreCustomRendezvousServer(Config::get_option(
-            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
-        ));
-        Config::set_option(
-            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_string(),
-            "1:2".to_string(),
-        );
-
-        assert_eq!(get_tcp_proxy_addr(), format!("[1:2]:{RENDEZVOUS_PORT}"));
-    }
-
-    #[tokio::test]
-    async fn test_http_request_via_tcp_proxy_rejects_invalid_header_json() {
-        let result = http_request_via_tcp_proxy("not a url", "get", None, "{").await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_http_request_via_tcp_proxy_rejects_non_object_header_json() {
-        let err = http_request_via_tcp_proxy("not a url", "get", None, "[]")
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("HTTP header information parsing failed!"));
-    }
-
-    #[test]
-    fn test_parse_json_header_entries_preserves_single_content_type() {
-        let headers = parse_json_header_entries(
-            r#"{"Content-Type":"text/plain","Authorization":"Bearer token"}"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            headers
-                .iter()
-                .filter(|entry| entry.name.eq_ignore_ascii_case("Content-Type"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            headers
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case("Content-Type"))
-                .map(|entry| entry.value.as_str()),
-            Some("text/plain")
-        );
-    }
-
-    #[test]
-    fn test_parse_json_header_entries_does_not_add_default_content_type() {
-        let headers = parse_json_header_entries(r#"{"Authorization":"Bearer token"}"#).unwrap();
-
-        assert!(!headers
-            .iter()
-            .any(|entry| entry.name.eq_ignore_ascii_case("Content-Type")));
-    }
-
-    #[test]
-    fn test_parse_simple_header_respects_custom_content_type() {
-        let headers = parse_simple_header("Content-Type: text/plain");
-
-        assert_eq!(
-            headers
-                .iter()
-                .filter(|entry| entry.name.eq_ignore_ascii_case("Content-Type"))
-                .count(),
-            1
-        );
-        assert_eq!(
-            headers
-                .iter()
-                .find(|entry| entry.name.eq_ignore_ascii_case("Content-Type"))
-                .map(|entry| entry.value.as_str()),
-            Some("text/plain")
-        );
-    }
-
-    #[test]
     fn test_parse_simple_header_preserves_non_content_type_header() {
         let headers = parse_simple_header("Authorization: Bearer token");
 
@@ -3216,22 +3331,6 @@ mod tests {
                 .find(|entry| entry.name.eq_ignore_ascii_case("Content-Type"))
                 .map(|entry| entry.value.as_str()),
             Some("application/json")
-        );
-    }
-
-    #[test]
-    fn test_tcp_proxy_log_target_redacts_query_only() {
-        assert_eq!(
-            tcp_proxy_log_target("https://example.com/api/heartbeat?token=secret"),
-            "https://example.com/api/heartbeat"
-        );
-    }
-
-    #[test]
-    fn test_tcp_proxy_log_target_brackets_ipv6_host_with_port() {
-        assert_eq!(
-            tcp_proxy_log_target("https://[2001:db8::1]:21114/api/heartbeat?token=secret"),
-            "https://[2001:db8::1]:21114/api/heartbeat"
         );
     }
 
@@ -3263,38 +3362,6 @@ mod tests {
         assert!(err.contains("TCP proxy error: dial failed"));
     }
 
-    #[test]
-    fn test_mouse_event_constants_and_mask_layout() {
-        use super::input::*;
-
-        // Verify MOUSE_TYPE constants are unique and within the mask range.
-        let types = [
-            MOUSE_TYPE_MOVE,
-            MOUSE_TYPE_DOWN,
-            MOUSE_TYPE_UP,
-            MOUSE_TYPE_WHEEL,
-            MOUSE_TYPE_TRACKPAD,
-            MOUSE_TYPE_MOVE_RELATIVE,
-        ];
-
-        let mut seen = std::collections::HashSet::new();
-        for t in types.iter() {
-            assert!(seen.insert(*t), "Duplicate mouse type: {}", t);
-            assert_eq!(
-                *t & MOUSE_TYPE_MASK,
-                *t,
-                "Mouse type {} exceeds mask {}",
-                t,
-                MOUSE_TYPE_MASK
-            );
-        }
-
-        // The mask layout is: lower 3 bits for type, upper bits for buttons (shifted by 3).
-        let combined_mask = MOUSE_TYPE_DOWN | ((MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT) << 3);
-        assert_eq!(combined_mask & MOUSE_TYPE_MASK, MOUSE_TYPE_DOWN);
-        assert_eq!(combined_mask >> 3, MOUSE_BUTTON_LEFT | MOUSE_BUTTON_RIGHT);
-    }
-
     /// A stand-in rendezvous server on loopback: accepts one connection and hands it to `serve`.
     async fn rendezvous_stub<F, Fut>(serve: F) -> String
     where
@@ -3316,6 +3383,26 @@ mod tests {
     fn server_key() -> (String, sign::SecretKey) {
         let (pk, sk) = sign::gen_keypair();
         (encode64(pk.0), sk)
+    }
+
+    fn signed_key_exchange(
+        pk: &box_::PublicKey,
+        sk: &sign::SecretKey,
+        version: u32,
+    ) -> KeyExchange {
+        let params = KxParams {
+            pk: pk.0.to_vec().into(),
+            version,
+            ..Default::default()
+        };
+        let mut payload = hbb_common::tcp::KX_PARAMS_DOMAIN.to_vec();
+        payload.extend_from_slice(&params.write_to_bytes().unwrap());
+        KeyExchange {
+            keys: vec![sign::sign(&pk.0, sk).into()],
+            version,
+            signed_params: sign::sign(&payload, sk).into(),
+            ..Default::default()
+        }
     }
 
     async fn connect(host: &str) -> Stream {
@@ -3346,37 +3433,180 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_secure_tcp_required_refuses_a_closed_connection() {
-        let (key, _) = server_key();
-        let host = rendezvous_stub(|s| async move { drop(s) }).await;
-        let mut conn = connect(&host).await;
-        assert!(secure_tcp_required(&mut conn, &key).await.is_err());
-        assert!(!conn.is_secured());
+    async fn test_secure_tcp_legacy_and_signed_servers_exchange_application_data() {
+        for (advertised, signed) in [(0, false), (1, true), (3, true)] {
+            for required in [false, true] {
+                let (key, sk) = server_key();
+                let host = rendezvous_stub(move |mut s| async move {
+                    let (mut eph_pk, eph_sk) = box_::gen_keypair();
+                    let mut msg = RendezvousMessage::new();
+                    let ex = if signed {
+                        eph_pk.0[31] |= 0x80;
+                        signed_key_exchange(&eph_pk, &sk, advertised)
+                    } else {
+                        KeyExchange {
+                            keys: vec![sign::sign(&eph_pk.0, &sk).into()],
+                            ..Default::default()
+                        }
+                    };
+                    msg.set_key_exchange(ex);
+                    s.send(&msg).await.unwrap();
+                    let reply = s.next_timeout(3000).await.unwrap().unwrap();
+                    let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+                    let Some(rendezvous_message::Union::KeyExchange(ex)) = reply.union else {
+                        panic!("expected the client's key exchange");
+                    };
+                    assert_eq!(ex.keys.len(), 2);
+                    assert_eq!(ex.version, hbb_common::tcp::kx_version_for(advertised));
+                    let shared =
+                        hbb_common::tcp::Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk)
+                            .unwrap();
+                    if ex.version >= 1 {
+                        s.set_key_split(
+                            shared,
+                            false,
+                            &hbb_common::tcp::KxTranscript {
+                                initiator_pk: &ex.keys[0],
+                                responder_pk: &eph_pk.0,
+                                advertised,
+                                picked: ex.version,
+                            },
+                        )
+                        .unwrap();
+                    } else {
+                        s.set_key(shared);
+                    }
+                    let request = s.next_timeout(3000).await.unwrap().unwrap();
+                    let request = RendezvousMessage::parse_from_bytes(&request).unwrap();
+                    let Some(rendezvous_message::Union::TestNatRequest(nat)) = request.union else {
+                        panic!("expected the client's nat request");
+                    };
+                    let mut msg = RendezvousMessage::new();
+                    msg.set_test_nat_response(TestNatResponse {
+                        port: nat.serial,
+                        ..Default::default()
+                    });
+                    s.send(&msg).await.unwrap();
+                })
+                .await;
+                let mut conn = connect(&host).await;
+                if required {
+                    secure_tcp_required(&mut conn, &key).await.unwrap();
+                } else {
+                    secure_tcp(&mut conn, &key).await.unwrap();
+                }
+                assert!(conn.is_secured());
+                let mut msg = RendezvousMessage::new();
+                msg.set_test_nat_request(TestNatRequest {
+                    serial: 7,
+                    ..Default::default()
+                });
+                conn.send(&msg).await.unwrap();
+                let reply = conn.next_timeout(3000).await.unwrap().unwrap();
+                let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
+                let Some(rendezvous_message::Union::TestNatResponse(nat)) = reply.union else {
+                    panic!("expected the server's nat response");
+                };
+                assert_eq!(nat.port, 7);
+            }
+        }
     }
 
     #[tokio::test]
-    async fn test_secure_tcp_required_accepts_a_completed_exchange() {
+    async fn test_secure_tcp_rejects_unverified_versions_before_reply() {
         let (key, sk) = server_key();
-        let host = rendezvous_stub(move |mut s| async move {
-            let (eph_pk, eph_sk) = box_::gen_keypair();
-            let mut msg = RendezvousMessage::new();
-            msg.set_key_exchange(KeyExchange {
-                keys: vec![sign::sign(&eph_pk.0, &sk).into()],
-                ..Default::default()
-            });
-            s.send(&msg).await.unwrap();
-            // The client's reply must decode to a key with the ephemeral secret half.
-            let reply = s.next_timeout(3000).await.unwrap().unwrap();
-            let reply = RendezvousMessage::parse_from_bytes(&reply).unwrap();
-            let Some(rendezvous_message::Union::KeyExchange(ex)) = reply.union else {
-                panic!("expected the client's key exchange");
-            };
-            hbb_common::tcp::Encrypt::decode(&ex.keys[1], &ex.keys[0], &eph_sk).unwrap();
-        })
-        .await;
-        let mut conn = connect(&host).await;
-        secure_tcp_required(&mut conn, &key).await.unwrap();
-        assert!(conn.is_secured());
+        let (mut eph_pk, _) = box_::gen_keypair();
+        eph_pk.0[31] |= 0x80;
+        let (other_pk, _) = box_::gen_keypair();
+        let (_, other_sk) = sign::gen_keypair();
+        for case in [
+            "missing_signature",
+            "stripped_version_and_signature",
+            "cleared_marker_and_stripped_fields",
+            "lowered_version",
+            "raised_version",
+            "replaced_public_key",
+            "invalid_signature",
+            "wrong_signer",
+            "unstructured_payload",
+            "undomained_params",
+            "signed_id_pk_as_params",
+        ] {
+            let mut ex = signed_key_exchange(&eph_pk, &sk, 1);
+            match case {
+                "missing_signature" => ex.signed_params = Bytes::new(),
+                "stripped_version_and_signature" => {
+                    ex.signed_params = Bytes::new();
+                    ex.version = 0;
+                }
+                "cleared_marker_and_stripped_fields" => {
+                    let mut signed_pk = ex.keys[0].to_vec();
+                    *signed_pk.last_mut().unwrap() &= 0x7f;
+                    ex.keys[0] = signed_pk.into();
+                    ex.signed_params = Bytes::new();
+                    ex.version = 0;
+                }
+                "lowered_version" => ex.version = 0,
+                "raised_version" => ex.version = 2,
+                "replaced_public_key" => ex.keys[0] = sign::sign(&other_pk.0, &sk).into(),
+                "invalid_signature" => {
+                    let mut signed = ex.signed_params.to_vec();
+                    signed[0] ^= 1;
+                    ex.signed_params = signed.into();
+                }
+                "wrong_signer" => {
+                    ex.signed_params = signed_key_exchange(&eph_pk, &other_sk, 1).signed_params;
+                }
+                "unstructured_payload" => {
+                    let mut payload = eph_pk.0.to_vec();
+                    payload.extend_from_slice(&1u32.to_le_bytes());
+                    ex.signed_params = sign::sign(&payload, &sk).into();
+                }
+                "undomained_params" => {
+                    let params = KxParams {
+                        pk: eph_pk.0.to_vec().into(),
+                        version: 1,
+                        ..Default::default()
+                    };
+                    ex.signed_params = sign::sign(&params.write_to_bytes().unwrap(), &sk).into();
+                }
+                "signed_id_pk_as_params" => {
+                    // The server signs IdPk with the same key; its `id` sits where `pk` does.
+                    let mut pk = [0x2au8; box_::PUBLICKEYBYTES];
+                    pk[30] = 0xc2;
+                    pk[31] = 0xaa;
+                    let id_pk = IdPk {
+                        id: String::from_utf8(pk.to_vec()).unwrap(),
+                        pk: vec![7u8; box_::PUBLICKEYBYTES].into(),
+                        ..Default::default()
+                    };
+                    ex.keys[0] = sign::sign(&pk, &sk).into();
+                    ex.version = 0;
+                    ex.signed_params = sign::sign(&id_pk.write_to_bytes().unwrap(), &sk).into();
+                }
+                _ => unreachable!(),
+            }
+            for required in [false, true] {
+                let mut msg = RendezvousMessage::new();
+                msg.set_key_exchange(ex.clone());
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let host = rendezvous_stub(move |mut s| async move {
+                    s.send(&msg).await.unwrap();
+                    tx.send(s.next_timeout(3000).await.is_none()).unwrap();
+                })
+                .await;
+                let mut conn = connect(&host).await;
+                let result = if required {
+                    secure_tcp_required(&mut conn, &key).await
+                } else {
+                    secure_tcp(&mut conn, &key).await
+                };
+                assert!(result.is_err(), "accepted {case}, required={required}");
+                assert!(!conn.is_secured());
+                drop(conn);
+                assert!(rx.await.unwrap(), "replied to {case}, required={required}");
+            }
+        }
     }
 
     #[test]
@@ -3395,7 +3625,7 @@ mod tests {
             &sk,
         );
 
-        let (id, their_pk, signed_fp) = decode_id_pk_dtls(&signed, &pk).unwrap();
+        let (id, their_pk, signed_fp, _) = decode_id_pk_dtls(&signed, &pk).unwrap();
         assert_eq!(id, "123456789");
         assert_eq!(their_pk, [7u8; 32]);
         assert_eq!(signed_fp, fp);
@@ -3415,12 +3645,5 @@ mod tests {
         // `decode_id_pk` is the same blob minus the fingerprint, so the field is invisible to
         // non-WebRTC handshakes.
         assert_eq!(decode_id_pk(&signed, &pk).unwrap(), (id, their_pk));
-    }
-
-    // The route probe is awaited on the connection path, so whatever it finds - an address, or
-    // no IPv6 route on this machine - it finds without waiting on the network.
-    #[tokio::test]
-    async fn test_ipv6_route_probe_does_not_wait_on_the_network() {
-        assert!(hbb_common::timeout(1_000, test_bind_ipv6()).await.is_ok());
     }
 }
