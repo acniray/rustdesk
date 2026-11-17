@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - feature/android-tcp-tunnel
+      - feature/android-tcp-tunnel-1.5.3
   workflow_dispatch:
 
 concurrency:
